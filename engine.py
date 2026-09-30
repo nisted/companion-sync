@@ -38,8 +38,15 @@ MAC = sys.platform == "darwin"
 NO_WINDOW = 0x08000000 if WIN else 0   # stop console windows flashing up from the app
 
 
+COMPANION_DOWNLOAD = "https://bitfocus.io/companion"
+
+
 class SyncError(Exception):
     """A problem to show the user, in plain words."""
+
+
+class NeedsUpdate(SyncError):
+    """This rig's Companion is older than the config: offer the download page."""
 
 
 class Offline(SyncError):
@@ -471,7 +478,7 @@ def take(s, confirm_takeover=None):
     if not dv:
         raise SyncError("There's no config on Google Drive yet.")
     if vkey(dv) > vkey(lv):
-        raise SyncError(f"The config on Google Drive is from Companion {vtext(dv)}, but this rig "
+        raise NeedsUpdate(f"The config on Google Drive is from Companion {vtext(dv)}, but this rig "
                         f"has Companion {vtext(lv)}.\nUpdate Companion on this rig first.")
     stop_companion(s)
     try:
@@ -516,7 +523,7 @@ def save(s, quiet=False):
     lv = local_version(s)
     dv = drive_version(s)
     if dv and vkey(lv) < vkey(dv):
-        raise SyncError(f"This rig's Companion ({vtext(lv)}) is older than the config on "
+        raise NeedsUpdate(f"This rig's Companion ({vtext(lv)}) is older than the config on "
                         f"Google Drive ({vtext(dv)}). Not saved.")
     upload(s, lv)
     write_lock(s, taken_time(h))

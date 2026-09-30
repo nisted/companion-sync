@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 
 import pystray
 from PIL import Image, ImageDraw
@@ -207,6 +208,9 @@ class App:
         try:
             self.set_state("busy", "Working…")
             fn()
+        except E.NeedsUpdate as e:
+            log.info(f"problem: {e}")
+            self.offer_download(str(e))
         except E.SyncError as e:
             log.info(f"problem: {e}")
             tell(str(e), problem=True)
@@ -271,6 +275,8 @@ class App:
             self.mine = True
             self.last_save = None
             self.notify(msg)
+        except E.NeedsUpdate as e:
+            self.offer_download(str(e))
         except E.SyncError as e:
             if ask(f"{e}\n\nOpen Companion anyway, with this rig's own copy?\n"
                    f"(Changes won't be kept.)"):
@@ -297,8 +303,17 @@ class App:
             who = "The config is free."
         extra = "\n\nThis rig's lock was taken over; its edits will go to 'stranded'." if st["stranded"] else ""
         saved = f"\nLast saved: {self.last_save:%H:%M}" if self.last_save else ""
-        tell(f"{who}{saved}\n\nThis rig: {self.s.rig}, Companion {E.vtext(lv)}\n"
-             f"Google Drive copy: Companion {E.vtext(st['drive_version'])}{extra}")
+        text = (f"{who}{saved}\n\nThis rig: {self.s.rig}, Companion {E.vtext(lv)}\n"
+                f"Google Drive copy: Companion {E.vtext(st['drive_version'])}{extra}")
+        dv = st["drive_version"]
+        if dv and E.vkey(dv) > E.vkey(lv):
+            self.offer_download(text + f"\n\nThis rig needs Companion {E.vtext(dv)} to use the config.")
+        else:
+            tell(text)
+
+    def offer_download(self, msg):
+        if ask(f"{msg}\n\nOpen the Companion download page?"):
+            webbrowser.open(E.COMPANION_DOWNLOAD)
 
     def sign_in(self):
         if not CLIENT_ID:
