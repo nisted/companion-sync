@@ -67,7 +67,7 @@ class Settings:
     base: str                          # Companion's config folder (holds v5.0 etc.)
     safety_dir: str                    # safety copies, OUTSIDE base
     holding_file: str                  # local note: this rig took the config
-    rig: str = field(default_factory=lambda: socket.gethostname().lower())
+    rig: str = field(default_factory=lambda: socket.gethostname().split(".")[0].lower())
     folder: str = "CompanionSync"      # folder on Google Drive
     rclone: str = "rclone"
     rclone_config: str = ""            # blank = rclone's default
@@ -87,11 +87,17 @@ class Settings:
 
 
 def _pick_base(parent):
+    """Companion's config folder. It's 'companion' or 'companion-nodejs' depending
+    on platform and history; if both exist, use the one with the newest version."""
+    best, best_v = os.path.join(parent, "companion"), (-1, -1)
     for d in ("companion", "companion-nodejs"):
         p = os.path.join(parent, d)
         if os.path.isdir(p):
-            return p
-    return os.path.join(parent, "companion")
+            vs = [vkey(n) for n in os.listdir(p) if vkey(n)]
+            v = max(vs) if vs else (-1, -1)
+            if v > best_v:
+                best, best_v = p, v
+    return best
 
 
 def default_settings(**kw):
