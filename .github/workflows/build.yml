@@ -2,6 +2,8 @@ name: Build Companion Sync
 
 on:
   push:
+    paths-ignore:
+      - '**.md'        # roadmap / readme edits don't need a new build
   workflow_dispatch:
 
 jobs:
