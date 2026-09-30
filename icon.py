@@ -1,56 +1,57 @@
-"""The Companion Sync icon: purple 'CS', the S with an arrowhead on each end."""
-import math
+"""The Companion Sync icon, made from logo-source.png (Nige's artwork)."""
+import os
+import sys
 
 from PIL import Image, ImageDraw
 
-PURPLE = (150, 80, 230, 255)
-S_SCALE = 4          # draw big, shrink down: smooth edges at any size
+SOURCE = "logo-source.png"
 
 
-def _arrow(d, cx, cy, r, angle_deg, length, width, colour):
-    """Arrowhead at a point on a circle, pointing clockwise along it."""
-    a = math.radians(angle_deg)
-    px, py = cx + r * math.cos(a), cy + r * math.sin(a)          # point on the circle
-    tx, ty = -math.sin(a), math.cos(a)                           # clockwise direction
-    nx, ny = math.cos(a), math.sin(a)                            # sideways
-    tip = (px + tx * length, py + ty * length)
-    left = (px + nx * width / 2, py + ny * width / 2)
-    right = (px - nx * width / 2, py - ny * width / 2)
-    d.polygon([tip, left, right], fill=colour)
+def _source_path():
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, SOURCE)
 
 
-def draw_cs(size, background=None, status=None):
-    """Return a size x size image of the CS mark.
+_square = None
 
-    background: optional (r, g, b, a) rounded-square behind the letters.
-    status: optional (r, g, b) dot in the bottom-right corner (tray icon).
-    """
-    S = 1024
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    if background:
-        d.rounded_rectangle((0, 0, S - 1, S - 1), radius=220, fill=background)
 
-    # C: open to the right
-    cx, cy, r, w = 300, 512, 215, 105
-    d.arc((cx - r, cy - r, cx + r, cy + r), 45, 315, fill=PURPLE, width=w)
+def _square_logo():
+    """The artwork cropped to the letters, centred on a transparent square."""
+    global _square
+    if _square is None:
+        im = Image.open(_source_path()).convert("RGBA")
+        box = im.getchannel("A").point(lambda a: 255 if a > 10 else 0).getbbox()
+        im = im.crop(box)
+        w, h = im.size
+        side = int(max(w, h) * 1.04)
+        sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        sq.alpha_composite(im, ((side - w) // 2, (side - h) // 2))
+        _square = sq
+    return _square
 
-    # S: two half-circles stacked, with arrowheads on both ends
-    sx, sr, sw = 735, 125, 95
-    top, bot = 512 - sr, 512 + sr
-    d.arc((sx - sr - sw // 2, top - sr - sw // 2, sx + sr + sw // 2, top + sr + sw // 2),
-          90, 300, fill=PURPLE, width=sw)
-    d.arc((sx - sr - sw // 2, bot - sr - sw // 2, sx + sr + sw // 2, bot + sr + sw // 2),
-          270, 480, fill=PURPLE, width=sw)
-    mid = sr                                                      # centre line of the stroke
-    _arrow(d, sx, top, mid, 300, 150, 210, PURPLE)                # top end: points right
-    _arrow(d, sx, bot, mid, 120, 150, 210, PURPLE)                # bottom end: points left
 
+def draw_cs(size, status=None, rounded=False):
+    """size x size icon. status: (r, g, b) dot in the corner for the tray.
+    rounded=True: the app icon, on a black rounded tile with a margin."""
+    img = _square_logo().resize((size, size), Image.LANCZOS)
+    if rounded:
+        tile = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+        inner = int(size * 0.8)
+        logo = _square_logo().resize((inner, inner), Image.LANCZOS)
+        tile.alpha_composite(logo, ((size - inner) // 2, (size - inner) // 2))
+        img = tile
     if status:
-        d.ellipse((700, 700, 1010, 1010), fill=(20, 20, 20, 255))
-        d.ellipse((730, 730, 980, 980), fill=tuple(status) + (255,))
-    return img.resize((size, size), Image.LANCZOS)
+        d = ImageDraw.Draw(img)
+        r = max(3, size * 0.2)
+        x0, y0 = size - 2 * r - 1, size - 2 * r - 1
+        d.ellipse((x0 - 1, y0 - 1, size - 1, size - 1), fill=(20, 20, 20, 255))
+        d.ellipse((x0, y0, size - 2, size - 2), fill=tuple(status) + (255,))
+    if rounded:
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=int(size * 0.2), fill=255)
+        img.putalpha(mask)
+    return img
 
 
 if __name__ == "__main__":                       # build step: write the app icon
-    draw_cs(1024, background=(28, 28, 36, 255)).save("icon.png")
+    draw_cs(1024, rounded=True).save("icon.png")

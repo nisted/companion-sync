@@ -29,10 +29,29 @@ STATUS_EVERY = 5 * 60       # seconds between lock checks on Drive when idle
 SINGLE_INSTANCE_PORT = 47823
 
 try:                          # written by the build from GitHub secrets
-    from _client import CLIENT_ID, CLIENT_SECRET
+    from _client import CLIENT_ID, CLIENT_SECRET, BUILD
 except ImportError:
     CLIENT_ID = os.environ.get("CS_CLIENT_ID", "")
     CLIENT_SECRET = os.environ.get("CS_CLIENT_SECRET", "")
+    BUILD = "dev"
+
+RELEASES = "https://github.com/nisted/companion-sync/releases/latest"
+UPDATE_URL = RELEASES + ("/download/Companion-Sync-Windows.exe" if E.WIN else "/download/Companion-Sync-Mac.zip")
+
+
+# Windows: a left-click on the tray icon opens the menu, like a right-click,
+# instead of running an action.
+if E.WIN:
+    from pystray import _win32 as _pw
+
+    _orig_notify = _pw.Icon._on_notify
+
+    def _left_click_opens_menu(self, wparam, lparam):
+        if lparam == 0x0202:           # WM_LBUTTONUP -> treat as WM_RBUTTONUP
+            lparam = 0x0205
+        return _orig_notify(self, wparam, lparam)
+
+    _pw.Icon._on_notify = _left_click_opens_menu
 
 
 # ---- places ------------------------------------------------------------------
@@ -182,7 +201,7 @@ class App:
         return pystray.Menu(
             M(lambda i: self.line, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            M("Open Companion", self.bg(self.open_companion), default=True),
+            M("Open Companion", self.bg(self.open_companion)),
             M("Save now", self.bg(self.save_now), enabled=lambda i: self.mine),
             M("Return config", self.bg(self.return_now), enabled=lambda i: self.mine),
             M("Status…", self.bg(self.show_status)),
@@ -192,6 +211,9 @@ class App:
             M("Start at login", lambda: set_login(not login_enabled()),
               checked=lambda i: login_enabled()),
             M("Open log", lambda: self.open_path(LOG_FILE)),
+            pystray.Menu.SEPARATOR,
+            M(f"Update {APP}…", self.update_app),
+            M(f"{APP} build {BUILD}", None, enabled=False),
             M(f"Quit {APP}", self.quit),
         )
 
@@ -310,6 +332,13 @@ class App:
             self.offer_download(text + f"\n\nThis rig needs Companion {E.vtext(dv)} to use the config.")
         else:
             tell(text)
+
+    def update_app(self):
+        tell(f"Your browser will download the latest {APP}.\n\n"
+             f"When it's downloaded: quit {APP} from this menu, replace the old "
+             f"{'Companion Sync.exe' if E.WIN else 'Companion Sync app in Applications'} "
+             f"with the new one, and open it again.")
+        webbrowser.open(UPDATE_URL)
 
     def offer_download(self, msg):
         if ask(f"{msg}\n\nOpen the Companion download page?"):

@@ -27,7 +27,7 @@ jobs:
           python build/write_client.py
           python icon.py
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." app.py
+        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
       - uses: actions/upload-artifact@v4
         with:
           name: Companion-Sync-Windows
@@ -56,7 +56,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --windowed --name "Companion Sync" --icon icon.png \
             --osx-bundle-identifier uk.co.nigelisted.companionsync \
-            --hidden-import pystray._darwin --add-binary "rclone:." app.py
+            --hidden-import pystray._darwin --add-binary "rclone:." --add-data "logo-source.png:." app.py
           # menu-bar only: no Dock icon
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
           codesign --force --deep -s - "dist/Companion Sync.app"
@@ -65,3 +65,27 @@ jobs:
         with:
           name: Companion-Sync-Mac
           path: Companion-Sync-Mac.zip
+
+  # Publish each build from main as the latest release, so the app's
+  # "Update Companion Sync" menu item can link straight to the download.
+  release:
+    if: github.ref == 'refs/heads/main'
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "out/Companion-Sync-Windows/Companion Sync.exe" Companion-Sync-Windows.exe
+          cp out/Companion-Sync-Mac/Companion-Sync-Mac.zip Companion-Sync-Mac.zip
+          gh release create "build-${{ github.run_number }}" \
+            Companion-Sync-Windows.exe Companion-Sync-Mac.zip \
+            --repo "${{ github.repository }}" --latest \
+            --title "Companion Sync build ${{ github.run_number }}" \
+            --notes "Built from ${{ github.sha }}"
