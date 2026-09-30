@@ -19,6 +19,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 import engine as E
+from icon import draw_cs
 
 APP = "Companion Sync"
 SAVE_EVERY = 15 * 60        # seconds
@@ -153,12 +154,7 @@ COLOURS = {
 
 
 def make_icon(state):
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, 60, 60), fill=COLOURS[state] + (255,))
-    d.ellipse((18, 18, 46, 46), fill=(255, 255, 255, 255))     # simple ring = "C"
-    d.rectangle((40, 26, 60, 38), fill=COLOURS[state] + (255,))
-    return img
+    return draw_cs(64, status=COLOURS[state])
 
 
 # ---- the app ------------------------------------------------------------------------

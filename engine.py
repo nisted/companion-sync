@@ -100,6 +100,33 @@ def _pick_base(parent):
     return best
 
 
+def stable_rig_name(path):
+    """This rig's name, fixed the first time it's worked out.
+
+    Macs rename themselves ('c3po' -> 'c3po (3)' / 'c3po-3.local') when they
+    think there's a clash on the network. The lock depends on the name staying
+    the same, so it's saved on first run and reused from then on.
+    """
+    try:
+        with open(path) as f:
+            saved = f.read().strip()
+        if saved:
+            return saved
+    except OSError:
+        pass
+    if MAC:
+        r = run(["scutil", "--get", "ComputerName"], check=False)
+        name = r.stdout.strip() or socket.gethostname().split(".")[0]
+        name = re.sub(r"\s*\(\d+\)$", "", name)            # 'c3po (3)'  -> 'c3po'
+        name = re.sub(r"-\d+$", "", name)                  # 'c3po-3'    -> 'c3po'
+    else:
+        name = socket.gethostname().split(".")[0]
+    name = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "rig"
+    with open(path, "w") as f:
+        f.write(name + "\n")
+    return name
+
+
 def default_settings(**kw):
     home = os.path.expanduser("~")
     if WIN:
@@ -118,6 +145,7 @@ def default_settings(**kw):
         s = Settings("pi", "/home/companion/.config/companion-nodejs",
                      "/home/companion/.config/companion-sync-safety-copies",
                      os.path.join(home, ".companion-sync-holding"))
+    s.rig = stable_rig_name(os.path.join(home, ".companion-sync-rig-name"))
     for k, v in kw.items():
         setattr(s, k, v)
     return s

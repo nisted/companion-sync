@@ -25,7 +25,7 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: |
           python build/write_client.py
-          python build/make_icon.py
+          python icon.py
       - name: Build
         run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." app.py
       - uses: actions/upload-artifact@v4
@@ -51,7 +51,7 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: |
           python build/write_client.py
-          python build/make_icon.py
+          python icon.py
       - name: Build
         run: |
           pyinstaller --noconfirm --windowed --name "Companion Sync" --icon icon.png \
