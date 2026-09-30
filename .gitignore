@@ -1,0 +1,11 @@
+_client.py
+google-oauth-client.json
+icon.png
+rclone
+rclone.exe
+rc.zip
+rc/
+build/*.spec
+dist/
+__pycache__/
+*.spec

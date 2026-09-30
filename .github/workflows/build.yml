@@ -1,0 +1,67 @@
+name: Build Companion Sync
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pystray pillow
+      - name: Get rclone
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://downloads.rclone.org/rclone-current-windows-amd64.zip -OutFile rc.zip
+          Expand-Archive rc.zip -DestinationPath rc
+          Copy-Item (Get-ChildItem rc -Recurse -Filter rclone.exe).FullName .
+      - name: Sign-in details and icon
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          python build/write_client.py
+          python build/make_icon.py
+      - name: Build
+        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Companion-Sync-Windows
+          path: dist/Companion Sync.exe
+
+  mac:
+    runs-on: macos-latest          # Apple silicon Macs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pystray pillow
+      - name: Get rclone
+        run: |
+          curl -sSL -o rc.zip https://downloads.rclone.org/rclone-current-osx-arm64.zip
+          unzip -q rc.zip && cp rclone-*/rclone . && chmod +x rclone
+      - name: Sign-in details and icon
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          python build/write_client.py
+          python build/make_icon.py
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --windowed --name "Companion Sync" --icon icon.png \
+            --osx-bundle-identifier uk.co.nigelisted.companionsync \
+            --hidden-import pystray._darwin --add-binary "rclone:." app.py
+          # menu-bar only: no Dock icon
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
+          codesign --force --deep -s - "dist/Companion Sync.app"
+          ditto -c -k --keepParent "dist/Companion Sync.app" Companion-Sync-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Companion-Sync-Mac
+          path: Companion-Sync-Mac.zip
