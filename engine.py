@@ -432,6 +432,104 @@ def upload(s, version, dest=None):
         rc(s, "purge", f"{s.remote}/history/{d.rstrip('/')}", check=False)
 
 
+# ---- modules ---------------------------------------------------------------
+# Companion keeps installed modules beside the version folders, not in them:
+#   <base>/modules/<id>-<version>    connection modules
+#   <base>/surfaces/<id>-<version>   surface integrations
+# so the config alone doesn't carry them. Store modules get re-downloaded by
+# Companion when it's online, but custom ones (imported packages) don't exist
+# anywhere else. Each version folder never changes once installed, so on save
+# any folder Drive doesn't have yet is uploaded to modules/ on Drive, and on
+# take any folder this rig doesn't have is copied in before Companion starts.
+# modules/modules.json lists what's on Drive. Nothing is ever deleted.
+
+MODULE_KINDS = {"modules": "connection", "surfaces": "surface"}
+MODULE_FOLDER_RE = re.compile(r"^(.+)-(\d+\.\d+\.\d+.*)$")     # 'allenheath-sq-3.1.1-grid.6'
+
+
+def _local_module_folders(s, sub):
+    d = os.path.join(s.base, sub)
+    return sorted(n for n in listdir(s, d) if MODULE_FOLDER_RE.match(n) and isdir(s, os.path.join(d, n)))
+
+
+def _drive_module_folders(s, sub):
+    r = rc(s, "lsf", "--dirs-only", f"{s.remote}/modules/{sub}", check=False)
+    _raise_if_offline(r)
+    return sorted(d.rstrip("/") for d in r.stdout.split() if MODULE_FOLDER_RE.match(d.rstrip("/")))
+
+
+def _copy_folder(s, src, dst):
+    """Copy a module folder; on the Pi, Companion's folders belong to the 'companion' user."""
+    if s.platform == "pi":
+        run(["sudo", "mkdir", "-p", os.path.dirname(dst)])
+        run(["sudo", "cp", "-a", src, dst])
+    else:
+        shutil.copytree(src, dst)
+
+
+def upload_modules(s):
+    """Upload installed module versions Drive doesn't have yet. Returns their names."""
+    added = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for sub in MODULE_KINDS:
+            have = set(_drive_module_folders(s, sub))
+            for name in _local_module_folders(s, sub):
+                if name in have:
+                    continue
+                staged = os.path.join(tmp, sub, name)
+                _copy_folder(s, os.path.join(s.base, sub, name), staged)
+                if s.platform == "pi":
+                    run(["sudo", "chown", "-R", os.environ.get("USER", "root"), os.path.join(tmp, sub)])
+                rc(s, "copy", staged, f"{s.remote}/modules/{sub}/{name}")
+                added.append(name)
+    if added or rc(s, "lsf", f"{s.remote}/modules/modules.json", check=False).returncode != 0:
+        _write_modules_list(s)
+    return added
+
+
+def _write_modules_list(s):
+    listing = {"updated": now(), "by": s.rig, "modules": []}
+    for sub, kind in MODULE_KINDS.items():
+        for name in _drive_module_folders(s, sub):
+            m = MODULE_FOLDER_RE.match(name)
+            listing["modules"].append({"type": kind, "id": m.group(1), "version": m.group(2), "folder": f"{sub}/{name}"})
+    rc(s, "rcat", f"{s.remote}/modules/modules.json", input=json.dumps(listing, indent=2) + "\n")
+
+
+def download_modules(s):
+    """Copy in module versions this rig is missing. Companion must be stopped. Returns their names."""
+    added = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for sub in MODULE_KINDS:
+            have = set(_local_module_folders(s, sub))
+            for name in _drive_module_folders(s, sub):
+                if name in have:
+                    continue
+                dl = os.path.join(tmp, sub, name)
+                rc(s, "copy", f"{s.remote}/modules/{sub}/{name}", dl)
+                if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
+                    s.log(f"Skipped module {name}: incomplete on Google Drive")
+                    continue
+                dst = os.path.join(s.base, sub, name)
+                _copy_folder(s, dl, dst)
+                if s.platform == "pi":
+                    run(["sudo", "chown", "-R", "companion:companion", dst])
+                added.append(name)
+    return added
+
+
+def _modules_step(s, fn, verb):
+    """Module sync never stops a take/save/return: problems are reported, not raised."""
+    try:
+        added = fn(s)
+        if added:
+            s.log(f"Modules {verb}: {', '.join(added)}")
+        return added
+    except SyncError as e:
+        s.log(f"Modules not synced: {e}")
+        return []
+
+
 def _save_stranded(s, holder):
     upload(s, local_version(s), f"{s.remote}/stranded/{s.rig}")
     return (f"NOT saved to the main copy: the config was taken over by {holder_name(holder) or 'nobody'}.\n"
@@ -495,6 +593,7 @@ def take(s, confirm_takeover=None):
                 moved = _move_to_safety(s, lv, "upgrade")
                 s.log(f"Companion {vtext(lv)} will upgrade the {vtext(dv)} config when it starts. "
                       f"Old {lv} folder kept at {moved}")
+        _modules_step(s, download_modules, "added to this rig")
     finally:
         start_companion(s)
     write_lock(s, now())
@@ -526,6 +625,7 @@ def save(s, quiet=False):
         raise NeedsUpdate(f"This rig's Companion ({vtext(lv)}) is older than the config on "
                         f"Google Drive ({vtext(dv)}). Not saved.")
     upload(s, lv)
+    _modules_step(s, upload_modules, "uploaded")
     write_lock(s, taken_time(h))
     mark_holding(s, True)
     note = f" (config upgraded to Companion {vtext(lv)})" if dv and lv != dv else ""
@@ -543,6 +643,7 @@ def return_(s):
     s.log("Uploading config to Google Drive...")
     lv = local_version(s)
     upload(s, lv)
+    _modules_step(s, upload_modules, "uploaded")
     rc(s, "deletefile", s.lock)
     mark_holding(s, False)
     return f"Config returned and unlocked. Changes made on {s.rig} from now on won't be kept."

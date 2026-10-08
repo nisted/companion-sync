@@ -13,6 +13,7 @@ Tick things off by editing this file.
 - [x] "Update Companion Sync" menu item and build number
 - [x] "Get Companion" download page offered when a rig's Companion is too old
 - [x] Left-click on the tray icon opens the menu (Windows)
+- [x] Module sync: installed module versions (incl. custom imports) go to Drive on save/return and are copied onto a rig on take; `modules/modules.json` lists them
 
 ## Next up
 
