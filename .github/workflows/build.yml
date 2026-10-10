@@ -68,11 +68,27 @@ jobs:
           name: Companion-Sync-Mac
           path: Companion-Sync-Mac.zip
 
+  pi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package for the Pi
+        run: |
+          mkdir -p pkg/companion-sync
+          cp -r engine.py panel pi pkg/companion-sync/
+          echo "${{ github.run_number }}" > pkg/companion-sync/BUILD
+          find pkg -name __pycache__ -prune -exec rm -rf {} +
+          tar czf Companion-Sync-Pi.tar.gz -C pkg companion-sync
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Companion-Sync-Pi
+          path: Companion-Sync-Pi.tar.gz
+
   # Publish each build from main as the latest release, so the app's
   # "Update Companion Sync" menu item can link straight to the download.
   release:
     if: github.ref == 'refs/heads/main'
-    needs: [windows, mac]
+    needs: [windows, mac, pi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -86,8 +102,9 @@ jobs:
         run: |
           cp "out/Companion-Sync-Windows/Companion Sync.exe" Companion-Sync-Windows.exe
           cp out/Companion-Sync-Mac/Companion-Sync-Mac.zip Companion-Sync-Mac.zip
+          cp out/Companion-Sync-Pi/Companion-Sync-Pi.tar.gz Companion-Sync-Pi.tar.gz
           gh release create "build-${{ github.run_number }}" \
-            Companion-Sync-Windows.exe Companion-Sync-Mac.zip \
+            Companion-Sync-Windows.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
             --repo "${{ github.repository }}" --latest \
             --title "Companion Sync build ${{ github.run_number }}" \
             --notes "Built from ${{ github.sha }}"

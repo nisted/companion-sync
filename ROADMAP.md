@@ -14,15 +14,18 @@ Tick things off by editing this file.
 - [x] "Get Companion" download page offered when a rig's Companion is too old
 - [x] Left-click on the tray icon opens the menu (Windows)
 - [x] Module sync: installed module versions (incl. custom imports) go to Drive on save/return and are copied onto a rig on take; `modules/modules.json` lists them
+- [x] BD-1 on the new engine (old script kept as `companion-sync.old-script`)
+- [x] BD-1 touchscreen panel: system / network / Companion / sync tabs, flashing alerts, tap-again confirm, start-up screen with Nige's logo, touch calibration
+- [x] Pi start-up check before Companion: takes the config if free, never blocks (about 6 s)
+- [x] Panel RESTART / SHUTDOWN return the config first; UPDATE COMPANION saves first, then installs the latest stable
+- [x] Pi install script; Pi package in each release; UPDATE CS on the panel
 
 ## Next up
 
 1. [ ] **Mac: update Companion to 5.0.** Open once so it moves the config across, quit, then check Status reads `c3po` and 5.0 on both sides.
-2. [ ] **BD-1: switch to the new engine,** replacing the old command-line script. *Needs the Pi on.*
-3. [ ] **Pi tray app.** Test the icon shows on BD-1's desktop, then a one-command install. *Needs the Pi on.*
-4. [ ] **Pi boot-time take,** before Companion starts. Must never block the show when offline or when another rig holds the config.
-5. [ ] **Companion button: return then shut down.** Small service file plus a permission rule, so it survives Companion stopping.
-6. [ ] **Fix BD-1's low-voltage warning.** Power supply or cable.
+2. [ ] **GitHub read-only key on BD-1** so UPDATE CS works.
+3. [ ] **Stream Deck button: return then shut down** (the panel does this already; a Companion button could call the same).
+4. [ ] **Fix BD-1's low-voltage warning.** Power supply or cable (the panel's SYSTEM tab shows it).
 
 ## Parked: making it available to others
 
