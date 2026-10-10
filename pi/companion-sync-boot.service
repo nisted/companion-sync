@@ -1,0 +1,17 @@
+[Unit]
+Description=Companion Sync: take the config before Companion starts (gives up quickly, never blocks it)
+After=network.target
+Before=companion.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+RuntimeDirectory=companion-sync
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/timeout 75 /usr/local/bin/companion-sync boot --report /run/companion-sync/boot.json
+SuccessExitStatus=124
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

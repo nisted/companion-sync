@@ -5,6 +5,10 @@
   companion-sync take     lock the config to this rig and download it
   companion-sync save     upload this rig's current config, keep the lock
   companion-sync return   upload this rig's config and release the lock
+  companion-sync boot --report FILE
+                          at start-up, before Companion runs: take the config
+                          if it's free or already this rig's, never ask, never
+                          wait long; the outcome is written to FILE as JSON
 
 Only one rig holds the config at a time. The holder saves every 15 minutes
 (SQLite live backup, so Companion keeps running). A lock not refreshed for
@@ -28,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 REMOTE_NAME = "gdrive"
@@ -78,6 +83,8 @@ class Settings:
     folder: str = "CompanionSync"      # folder on Google Drive
     rclone: str = "rclone"
     rclone_config: str = ""            # blank = rclone's default
+    rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
+    state_file: str = ""               # last save / last problem, for the Pi panel
     companion_app: str = ""            # desktop: what to launch
     keep_local: int = 5
     keep_history: int = 30
@@ -153,6 +160,7 @@ def default_settings(**kw):
                      "/home/companion/.config/companion-sync-safety-copies",
                      os.path.join(home, ".companion-sync-holding"))
     s.rig = stable_rig_name(os.path.join(home, ".companion-sync-rig-name"))
+    s.state_file = os.path.join(home, ".companion-sync-state.json")
     for k, v in kw.items():
         setattr(s, k, v)
     return s
@@ -168,8 +176,43 @@ def run(cmd, check=True, input=None):
 
 
 def rc(s, *args, check=True, input=None):
-    cmd = [s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + list(args)
+    cmd = [s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + list(s.rclone_flags) + list(args)
     return run(cmd, check=check, input=input)
+
+
+# ---- local record of how syncing is going (shown on the Pi panel) ----------
+
+def read_state(s):
+    try:
+        with open(s.state_file) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record(s, **changes):
+    """Merge changes into the state file. Never lets a write problem stop a sync."""
+    if not s.state_file:
+        return
+    st = read_state(s)
+    st.update(changes)
+    try:
+        tmp = s.state_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=1)
+        os.replace(tmp, s.state_file)
+    except OSError:
+        pass
+
+
+def record_ok(s, action):
+    t = datetime.datetime.now().isoformat(timespec="seconds")
+    record(s, last_save=t, last_action=action, last_error=None, last_error_time=None)
+
+
+def record_error(s, action, message):
+    record(s, last_error=f"{action}: {message}".strip(),
+           last_error_time=datetime.datetime.now().isoformat(timespec="seconds"))
 
 
 def signed_in(s):
@@ -551,11 +594,13 @@ def status(s):
     }
 
 
-def take(s, confirm_takeover=None):
+def take(s, confirm_takeover=None, manage_companion=True):
     """Lock the config to this rig and install Drive's copy.
 
     confirm_takeover(message) -> bool is asked before taking over a stale
     lock; without it, a stale lock is never taken over (e.g. at boot).
+    manage_companion=False: Companion isn't running and mustn't be started
+    (the Pi's boot check runs before Companion's service).
     """
     lv = local_version(s)
     h = lock_holder(s)
@@ -578,7 +623,8 @@ def take(s, confirm_takeover=None):
     if vkey(dv) > vkey(lv):
         raise NeedsUpdate(f"The config on Google Drive is from Companion {vtext(dv)}, but this rig "
                         f"has Companion {vtext(lv)}.\nUpdate Companion on this rig first.")
-    stop_companion(s)
+    if manage_companion:
+        stop_companion(s)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dl = os.path.join(tmp, dv)
@@ -595,9 +641,11 @@ def take(s, confirm_takeover=None):
                       f"Old {lv} folder kept at {moved}")
         _modules_step(s, download_modules, "added to this rig")
     finally:
-        start_companion(s)
+        if manage_companion:
+            start_companion(s)
     write_lock(s, now())
     mark_holding(s, True)
+    record_ok(s, "take")
     return f"{s.rig} now has the config."
 
 
@@ -628,6 +676,7 @@ def save(s, quiet=False):
     _modules_step(s, upload_modules, "uploaded")
     write_lock(s, taken_time(h))
     mark_holding(s, True)
+    record_ok(s, "save")
     note = f" (config upgraded to Companion {vtext(lv)})" if dv and lv != dv else ""
     return f"Saved to Google Drive{note}. {s.rig} still has the config."
 
@@ -646,7 +695,51 @@ def return_(s):
     _modules_step(s, upload_modules, "uploaded")
     rc(s, "deletefile", s.lock)
     mark_holding(s, False)
+    record_ok(s, "return")
     return f"Config returned and unlocked. Changes made on {s.rig} from now on won't be kept."
+
+
+def boot(s, net_wait=20):
+    """Start-up check on the Pi, before Companion starts. Never asks, never raises.
+
+    Takes the config if it's free or already this rig's; otherwise leaves the
+    local copy alone. Returns a dict for the panel:
+      result: taken | already | held | offline | not_signed_in | needs_update | error
+    """
+    out = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "rig": s.rig,
+           "holder": None, "message": ""}
+    deadline = datetime.datetime.now() + datetime.timedelta(seconds=net_wait)
+    while datetime.datetime.now() < deadline and not _have_default_route():
+        time.sleep(1)
+    try:
+        if not signed_in(s):
+            out.update(result="not_signed_in", message="Not signed in to Google Drive.")
+            return out
+        h = lock_holder(s)
+        out["holder"] = holder_name(h)
+        if h and holder_name(h) != s.rig:
+            out.update(result="held", message=f"Config held by {holder_name(h)}. Using the local copy.")
+            return out
+        msg = take(s, None, manage_companion=False)
+        out.update(result="already" if h else "taken", holder=s.rig, message=msg)
+    except Offline as e:
+        out.update(result="offline", message=str(e).splitlines()[0])
+    except NeedsUpdate as e:
+        out.update(result="needs_update", message=str(e).replace("\n", " "))
+        record_error(s, "start-up", out["message"])
+    except SyncError as e:
+        out.update(result="error", message=str(e).replace("\n", " "))
+        record_error(s, "start-up", out["message"])
+    except Exception as e:                      # never stop Companion starting
+        out.update(result="error", message=f"{type(e).__name__}: {e}")
+    return out
+
+
+def _have_default_route():
+    if not os.path.exists("/proc/net/route"):
+        return True
+    with open("/proc/net/route") as f:
+        return any(line.split()[1] == "00000000" for line in f.readlines()[1:] if line.split())
 
 
 # ---- command line (the Pi) -------------------------------------------------
@@ -665,6 +758,19 @@ def main(argv):
     s = default_settings()
     cmd = argv[0] if argv else ""
     quiet = "--quiet" in argv
+    if cmd == "boot":
+        report = argv[argv.index("--report") + 1] if "--report" in argv else None
+        # fail fast: Companion is waiting for this to finish
+        s.rclone_flags = ["--contimeout", "10s", "--timeout", "20s", "--retries", "1", "--low-level-retries", "2"]
+        out = boot(s)
+        text = json.dumps(out, indent=1)
+        print(text)
+        if report:
+            os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
+            with open(report + ".tmp", "w") as f:
+                f.write(text + "\n")
+            os.replace(report + ".tmp", report)
+        return 0
     try:
         if cmd == "status":
             st = status(s)
@@ -689,6 +795,8 @@ def main(argv):
             print(__doc__)
             return 1
     except SyncError as e:
+        if cmd in ("take", "save", "return") and not isinstance(e, Offline):
+            record_error(s, cmd, str(e).replace("\n", " "))
         if quiet:
             return 0
         print(f"\n{e}")

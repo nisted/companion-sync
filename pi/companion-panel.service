@@ -1,0 +1,14 @@
+[Unit]
+Description=BD-1 touchscreen panel (Companion Sync)
+After=local-fs.target
+
+[Service]
+User=@USER@
+ExecStart=/usr/bin/python3 /opt/companion-sync/panel/panel.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
