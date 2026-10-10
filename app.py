@@ -213,6 +213,7 @@ class App:
             M("Open log", lambda: self.open_path(LOG_FILE)),
             pystray.Menu.SEPARATOR,
             M(f"Update {APP}…", self.update_app),
+            M("Get Companion…", lambda: webbrowser.open(E.COMPANION_DOWNLOAD)),
             M(f"{APP} build {BUILD}", None, enabled=False),
             M(f"Quit {APP}", self.quit),
         )
