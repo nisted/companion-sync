@@ -681,7 +681,8 @@ class Panel:
             lines.append(f"Last problem: {sn['last_error']}")
         boot = self.data.get("boot")
         if boot:
-            lines.append(f"Start-up: {boot.get('message') or boot.get('result')}")
+            when = str(boot.get("time", ""))[11:16]
+            lines.append(f"At start-up ({when}): {boot.get('message') or boot.get('result')}")
         self.message("STATUS", *lines, small=True)
 
     def do_log(self):
