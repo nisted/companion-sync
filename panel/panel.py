@@ -35,8 +35,9 @@ DEFAULTS = {
     "pin_dc": 22, "pin_rst": 27, "pin_touch_irq": 17,
     "lcd_madctl": 0x28,                       # landscape
     # touch calibration (raw XPT2046 readings at the screen edges)
-    "touch_x_min": 300, "touch_x_max": 3800, "touch_y_min": 300, "touch_y_max": 3800,
-    "touch_swap_xy": False, "touch_invert_x": True, "touch_invert_y": False,
+    # (measured on BD-1's screen; run calibrate.py to redo)
+    "touch_x_min": 85, "touch_x_max": 3747, "touch_y_min": 348, "touch_y_max": 3805,
+    "touch_swap_xy": True, "touch_invert_x": False, "touch_invert_y": True,
     "touch_release_s": 0.15,
     # behaviour
     "confirm_s": 4, "flash_s": 0.5, "frame_s": 0.25,
