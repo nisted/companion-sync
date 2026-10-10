@@ -688,6 +688,8 @@ class Panel:
         out = info.sh(["sudo", "journalctl", "-u", "companion-panel", "-u", "companion-sync-boot",
                        "-u", "companion-sync-save", "-n", "40", "--no-pager", "-o", "short"])
         for line in (out or "").splitlines():
+            if "pam_unix" in line or "COMMAND=" in line:     # sudo's own bookkeeping
+                continue
             parts = line.split(None, 4)                 # 'Oct 10 23:01:02 bd-1 unit[pid]: message'
             if len(parts) == 5:
                 msg = parts[4].split(": ", 1)[-1]

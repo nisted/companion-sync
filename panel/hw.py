@@ -127,21 +127,30 @@ class Hardware:
     def _pressed(self):
         return self.ins.get_value(self.irq) == self.V.INACTIVE
 
-    def tap(self):
-        """(x, y) in screen pixels for a new touch, else None."""
-        c = self.cfg
+    def raw_tap(self):
+        """Raw (x, y) controller readings for a new touch, else None."""
         now = time.monotonic()
         if not self._pressed():
             if self._down:
                 self._down = False
                 self._up_since = now
             return None
-        if self._down or now - self._up_since < c["touch_release_s"]:
+        if self._down or now - self._up_since < self.cfg["touch_release_s"]:
             return None
-        rx, ry = self._raw()
+        time.sleep(0.03)                                 # let the touch settle
+        r = self._raw()
         if not self._pressed():                          # let go mid-reading: ignore
             return None
         self._down = True
+        return r
+
+    def tap(self):
+        """(x, y) in screen pixels for a new touch, else None."""
+        r = self.raw_tap()
+        return self.to_screen(*r) if r else None
+
+    def to_screen(self, rx, ry):
+        c = self.cfg
         if c["touch_swap_xy"]:
             rx, ry = ry, rx
         tx = (rx - c["touch_x_min"]) / max(1, c["touch_x_max"] - c["touch_x_min"])
