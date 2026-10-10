@@ -758,8 +758,12 @@ class Panel:
         d = ImageDraw.Draw(img)
         if self.logo:
             img.paste(self.logo, ((W - self.logo.width) // 2, 30), self.logo)
-        state = info.sh(["systemctl", "is-system-running"]) or ""
-        text = "BD-1 // OFFLINE" if state == "stopping" else "PANEL RESTARTING"
+        try:      # is-system-running exits non-zero unless 'running', so read its output regardless
+            state = subprocess.run(["systemctl", "is-system-running"], capture_output=True,
+                                   text=True, timeout=5).stdout.strip()
+        except Exception:
+            state = ""
+        text = "PANEL RESTARTING" if state in ("running", "degraded") else "BD-1 // OFFLINE"
         d.text((W // 2, 190), text, font=Fonts.head, fill=C["lavender"], anchor="mm")
         self.hw.frame = None
         self.hw.show(img)
