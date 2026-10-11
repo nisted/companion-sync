@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import dataclasses
 import time
 import traceback
 
@@ -389,7 +390,59 @@ def t_encryption_off(w):
     assert read_value(b.base) == SECRET
 
 
-SCENARIOS = [t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def new_folder_storage(w, s, name="moved-here"):
+    path = os.path.join(w.tmp, name)
+    os.makedirs(path, exist_ok=True)
+    n = dataclasses.replace(s)
+    E.use_folder(n, "nas", path)
+    return n
+
+
+def t_move_storage(w):
+    """The holder moves the config (and modules) to empty storage; rigs left on the old one are stopped."""
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    add_module(a.base, "custom-thing-1.0.0")
+    make_config(a.base, value="latest")                         # unsaved: the move saves it first
+    expect_error(lambda: E.move_storage(b, new_folder_storage(w, b)), "only the rig")
+    full = new_folder_storage(w, a, "already-used")
+    E.write_lock(full, E.now())
+    expect_error(lambda: E.move_storage(a, full), "already has")
+    a2 = new_folder_storage(w, a)
+    E.move_storage(a, a2)
+    assert E.status(a2)["mine"] and E.status(a)["moved"]
+    make_config(b.base, value="b")
+    expect_error(lambda: E.take(b), "has moved")                # bravo still on the old storage
+    b2 = dataclasses.replace(b, storage="folder", storage_kind="nas", folder_path=a2.folder_path)
+    expect_error(lambda: E.take(b2), "being used by alpha")
+    E.return_(a2)
+    E.take(b2)
+    assert read_value(b2.base) == "latest"
+    assert os.path.exists(os.path.join(b2.base, "modules", "custom-thing-1.0.0", "companion", "manifest.json"))
+    expect_error(lambda: E.move_storage(a, new_folder_storage(w, a, "again")), "already moved")
+
+
+def t_move_encrypted(w):
+    """Encrypted storage moves encrypted, same passphrase; nothing readable lands in the new one."""
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    make_config(a.base, value=SECRET)
+    E.write_lock(a, E.now()); E.mark_holding(a, True); E.save(a)
+    E.turn_on_encryption(a, PASS)
+    E.unlock(b, PASS)
+    a2 = new_folder_storage(w, a)
+    E.move_storage(a, a2)
+    for root, _, files in os.walk(a2.folder_path):
+        for f in files:
+            with open(os.path.join(root, f), "rb") as fh:
+                assert SECRET.encode() not in fh.read(), f
+    E.return_(a2)
+    b2 = dataclasses.replace(b, storage="folder", storage_kind="nas", folder_path=a2.folder_path)
+    make_config(b2.base, value="x")
+    E.take(b2)                                                  # bravo's passphrase still works
+    assert read_value(b2.base) == SECRET
+
+
+SCENARIOS = [t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

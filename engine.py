@@ -1549,6 +1549,7 @@ def status(s):
     tidy_safety_copies(s)
     h = lock_holder(s)
     return {
+        "moved": moved_to(s),
         "holder": holder_name(h),
         "mine": holder_name(h) == s.rig,
         "age_hours": lock_age_hours(s) if h else None,
@@ -1566,6 +1567,9 @@ def take(s, confirm_takeover=None, manage_companion=True):
     (the Pi's boot check runs before Companion's service).
     """
     lv = local_version(s)
+    m = moved_to(s)
+    if m:
+        raise SyncError(f"The config has moved {m}.\n\nChoose the new storage in Storage… on this rig.")
     h = lock_holder(s)
     if h and holder_name(h) == s.rig:
         mark_holding(s, True)
@@ -1663,8 +1667,62 @@ def return_(s):
     return f"Config returned and unlocked. Changes made on {s.rig} from now on won't be kept."
 
 
+# ---- moving to another storage ---------------------------------------------
+# The rig that has the config copies it (and every module) into the new, empty
+# storage and keeps holding it there. The old storage keeps its copy and
+# history as a backup, but gets a MOVED note and a lock that says where it
+# went, so no rig can carry on with the old copy by mistake.
+
+MOVED_FILE = "MOVED"
+
+
+def moved_to(s):
+    """Where the config went, if it has moved out of this storage, else None."""
+    text = s.store.read(MOVED_FILE)
+    return text.strip() if text and text.strip() else None
+
+
+def move_storage(s, new):
+    """Move the shared config from s's storage to new's (a copy of the settings
+    pointed at the new storage). This rig must have the config."""
+    if moved_to(s):
+        raise SyncError(f"The config has already moved: {moved_to(s)}")
+    if holder_name(lock_holder(s)) != s.rig:
+        raise SyncError("Only the rig that has the config can move it. Take the config first.")
+    if drive_version(new) or lock_holder(new):
+        raise SyncError(f"{new.place} already has a Companion Sync config in it. "
+                        f"Move into an empty one (or a different folder / repository).")
+    save(s)                                                   # the latest goes along
+    old_data = data_store(s)
+    marker = s.store.read(ENC_MARKER)
+    if marker:                                                # stays encrypted, same passphrase
+        new.store.write(ENC_MARKER, marker)
+        new.key_file = s.key_file
+    new_data = data_store(new)
+    write_lock(new, now())
+    s.log(f"Copying the config to {new.place}...")
+    upload(new, local_version(s))
+    with tempfile.TemporaryDirectory() as tmp:
+        for sub in MODULE_KINDS:
+            for name in _drive_module_folders(s, sub):
+                here = os.path.join(tmp, sub, name)
+                old_data.copy_down(f"modules/{sub}/{name}", here)
+                new_data.copy_up(here, f"modules/{sub}/{name}")
+    _modules_step(new, upload_modules, "uploaded")            # and any only on this rig
+    _write_modules_list(new)
+    s.store.write(MOVED_FILE, f"to {new.place} ({new.store.describe()}), by {s.rig} on {now()}\n")
+    s.store.write("LOCK", f"moved to {new.place} | taken {now()} | last seen {now()}\n")
+    mark_holding(new, True)
+    record_ok(new, "save")
+    return (f"The config has moved to {new.place}, and {s.rig} still has it.\n\n"
+            f"On every other rig, choose {new.place} in Storage… (same account). The old copy "
+            f"stays in {s.place} as a backup, marked as moved.")
+
+
 def start_sharing(s):
     """First rig: put this rig's config into empty storage and hold it."""
+    if moved_to(s):
+        raise SyncError(f"The config has moved {moved_to(s)}.")
     if drive_version(s):
         raise SyncError(f"There's already a config in {s.place}. Use Open Companion / take instead.")
     if lock_holder(s):

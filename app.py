@@ -7,6 +7,7 @@ Sits in the tray, shows who has the Companion config, and does the sync:
   - returns the config automatically when Companion is quit
 All the real work is in engine.py, shared with the Pi.
 """
+import dataclasses
 import datetime
 import logging
 import os
@@ -398,7 +399,9 @@ class App:
             self.set_state("problem", str(e).splitlines()[0])
             return
         self.mine = st["mine"]
-        if st["mine"]:
+        if st.get("moved"):
+            self.set_state("problem", f"Config has moved {st['moved'].split(' (')[0]}: see Storage…")
+        elif st["mine"]:
             saved = f", saved {self.last_save:%H:%M}" if self.last_save else ""
             self.set_state("mine", f"This rig has the config{saved}")
         elif st["holder"]:
@@ -563,18 +566,21 @@ class App:
     def choose_storage(self):
         """Choose where the shared config lives, sign in, and check the connection.
         Every rig sharing a config must choose the same storage and account."""
-        if self.mine or E.was_holding(self.s):
-            tell(f"This rig has the config, so the storage can't be changed right now.\n\n"
-                 f"Choose Return config first, then come back to Storage….")
+        moving = self.mine
+        if not moving and E.was_holding(self.s):
+            tell("This rig's lock was taken over by another rig. Save or return the config first "
+                 "(its changes go to 'stranded'), then come back to Storage….")
             return
         labels = [label for _, label in self.STORAGE_OPTIONS]
-        picked = choose(f"Where should the shared Companion config live?\n\n"
+        intro = (f"This rig has the config, so the config will MOVE to the storage you pick "
+                 f"(it must be empty). Every other rig then needs to choose it too.\n\n"
+                 if moving else "")
+        picked = choose(f"{intro}Where should the shared Companion config live?\n\n"
                         f"Now: {self.s.place}. Every rig must use the same storage and account.", labels)
         if not picked:
             return
         key = dict((label, k) for k, label in self.STORAGE_OPTIONS)[picked]
-        s = E.default_settings(log=log.info)          # try it out on a copy; keep the old choice if it fails
-        s.rclone = self.s.rclone
+        s = dataclasses.replace(self.s)                # try it out on a copy; keep the old choice if it fails
         if key == "gdrive":
             if not CLIENT_ID:
                 raise E.SyncError("This build has no Google sign-in details.")
@@ -618,6 +624,14 @@ class App:
             E.use_folder(s, "icloud", root)
         self.set_state("busy", f"Checking {s.place}…")
         result = E.check_storage(s)
+        if moving:
+            if s.storage_kind == self.s.storage_kind and s.store.describe() == self.s.store.describe():
+                tell(f"That's the storage the config is already in ({self.s.place}).")
+                return
+            if not ask(f"{result}\n\nMove the config from {self.s.place} to {s.place} now?"):
+                return
+            self.set_state("busy", f"Moving the config to {s.place}…")
+            result = E.move_storage(self.s, s)
         for k in E.SAVED_CHOICE:                      # it works: switch over and remember it
             setattr(self.s, k, getattr(s, k))
         E.save_storage_choice(self.s)
@@ -625,6 +639,7 @@ class App:
                 "so wait a moment after returning the config on one rig before opening it on another."
                 if key == "icloud" else "")
         tell(f"{result}\n\nThis rig now uses {self.s.place}.{note}")
+        self.mine = moving
 
     def open_path(self, p):
         if E.WIN:
