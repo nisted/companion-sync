@@ -85,6 +85,9 @@ class Settings:
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
     state_file: str = ""               # last save / last problem, for the Pi panel
+    storage: str = "rclone"            # 'rclone' (Google Drive etc.) or 'folder'
+    rclone_remote: str = REMOTE_NAME   # which rclone remote, when storage is 'rclone'
+    folder_path: str = ""              # the shared folder, when storage is 'folder'
     companion_app: str = ""            # desktop: what to launch
     keep_local: int = 5
     keep_history: int = 30
@@ -93,11 +96,15 @@ class Settings:
 
     @property
     def remote(self):
-        return f"{REMOTE_NAME}:{self.folder}"
+        return f"{self.rclone_remote}:{self.folder}"
 
     @property
-    def lock(self):
-        return f"{self.remote}/LOCK"
+    def store(self):
+        """Where the shared config lives. Made fresh each time, so a copy of the
+        settings with different rclone flags (the Pi panel) behaves accordingly."""
+        if self.storage == "folder":
+            return FolderStorage(self.folder_path)
+        return RcloneStorage(self)
 
 
 def _pick_base(parent):
@@ -216,8 +223,210 @@ def record_error(s, action, message):
 
 
 def signed_in(s):
-    r = rc(s, "listremotes", check=False)
-    return r.returncode == 0 and f"{REMOTE_NAME}:" in r.stdout.split()
+    return s.store.signed_in()
+
+
+# ---- storage ---------------------------------------------------------------
+# Everything the sync needs from wherever the shared config lives. Paths are
+# relative to the Companion Sync folder there ('' is the folder itself), with
+# '/' as the separator. Reads raise Offline when the storage can't be reached;
+# a missing file or folder is not an error.
+
+class RcloneStorage:
+    """Google Drive (and anything else rclone can reach)."""
+
+    def __init__(self, s):
+        self.s = s
+
+    def _p(self, rel):
+        return f"{self.s.remote}/{rel}" if rel else self.s.remote
+
+    def describe(self):
+        return f"{self.s.rclone_remote}:{self.s.folder}"
+
+    def signed_in(self):
+        r = rc(self.s, "listremotes", check=False)
+        return r.returncode == 0 and f"{self.s.rclone_remote}:" in r.stdout.split()
+
+    def read(self, rel):
+        r = rc(self.s, "cat", self._p(rel), check=False)
+        _raise_if_offline(r)
+        return r.stdout if r.returncode == 0 else None
+
+    def write(self, rel, text):
+        rc(self.s, "rcat", self._p(rel), input=text)
+
+    def delete(self, rel):
+        rc(self.s, "deletefile", self._p(rel))
+
+    def age_hours(self, rel):
+        r = rc(self.s, "lsjson", self._p(rel), check=False)
+        try:
+            t = json.loads(r.stdout)[0]["ModTime"]        # e.g. 2026-09-30T12:03:01.123456789+01:00
+            t = re.sub(r"\.\d+", "", t).replace("Z", "+00:00")
+            return (datetime.datetime.now(datetime.timezone.utc)
+                    - datetime.datetime.fromisoformat(t)).total_seconds() / 3600
+        except Exception:
+            return 0.0
+
+    def dirs(self, rel, strict=False):
+        r = rc(self.s, "lsf", "--dirs-only", self._p(rel), check=False)
+        if strict:
+            _raise_if_offline(r)
+        return [d.rstrip("/") for d in r.stdout.split()] if r.returncode == 0 else []
+
+    def exists(self, rel):
+        return rc(self.s, "lsf", self._p(rel), check=False).returncode == 0
+
+    def push_tree(self, local, rel, backup_rel=None):
+        """Make `rel` match the local folder (Companion's own backups excluded),
+        keeping anything replaced or removed in `backup_rel`, then verify."""
+        cmd = ["sync", local, self._p(rel), "--checksum", "--exclude", EXCLUDE]
+        if backup_rel:
+            cmd += ["--backup-dir", self._p(backup_rel)]
+        rc(self.s, *cmd)
+        rc(self.s, "check", local, self._p(rel), "--exclude", EXCLUDE)
+
+    def pull_tree(self, rel, local):
+        rc(self.s, "copy", self._p(rel), local, "--exclude", EXCLUDE)
+
+    def copy_up(self, local, rel):
+        rc(self.s, "copy", local, self._p(rel))
+
+    def copy_down(self, rel, local):
+        rc(self.s, "copy", self._p(rel), local)
+
+    def purge(self, rel):
+        rc(self.s, "purge", self._p(rel), check=False)
+
+
+class FolderStorage:
+    """A shared folder: network share / NAS, or a folder a sync app keeps up to
+    date (iCloud Drive). The folder itself must exist; Companion Sync makes
+    everything inside it."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def _p(self, rel):
+        return os.path.join(self.root, *rel.split("/")) if rel else self.root
+
+    def _check(self):
+        if not self.root or not os.path.isdir(self.root):
+            raise Offline(f"Can't reach the shared folder:\n  {self.root or '(none chosen)'}")
+
+    def describe(self):
+        return self.root
+
+    def signed_in(self):
+        return bool(self.root) and os.path.isdir(self.root)
+
+    def read(self, rel):
+        self._check()
+        try:
+            with open(self._p(rel), encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise Offline(f"Can't read from the shared folder: {e}")
+
+    def write(self, rel, text):
+        self._check()
+        p = self._p(rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+
+    def delete(self, rel):
+        self._check()
+        try:
+            os.remove(self._p(rel))
+        except FileNotFoundError:
+            pass
+
+    def age_hours(self, rel):
+        try:
+            return (time.time() - os.path.getmtime(self._p(rel))) / 3600
+        except OSError:
+            return 0.0
+
+    def dirs(self, rel, strict=False):
+        if strict:
+            self._check()
+        p = self._p(rel)
+        if not os.path.isdir(p):
+            return []
+        return sorted(n for n in os.listdir(p) if os.path.isdir(os.path.join(p, n)))
+
+    def exists(self, rel):
+        return os.path.exists(self._p(rel))
+
+    @staticmethod
+    def _files(top):
+        """Relative paths of files under top, without Companion's own backups."""
+        out = {}
+        for root, dirs, files in os.walk(top):
+            if root == top:
+                dirs[:] = [d for d in dirs if d != "backups"]
+            for f in files:
+                full = os.path.join(root, f)
+                out[os.path.relpath(full, top)] = full
+        return out
+
+    @staticmethod
+    def _same(a, b):
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(1 << 20), fb.read(1 << 20)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+
+    def push_tree(self, local, rel, backup_rel=None):
+        self._check()
+        dest = self._p(rel)
+        backup = self._p(backup_rel) if backup_rel else None
+        os.makedirs(dest, exist_ok=True)
+        have, want = self._files(dest), self._files(local)
+        for r, full in have.items():                      # replaced or removed: keep a copy
+            if r not in want or not self._same(want[r], full):
+                if backup:
+                    os.makedirs(os.path.dirname(os.path.join(backup, r)), exist_ok=True)
+                    shutil.move(full, os.path.join(backup, r))
+                else:
+                    os.remove(full)
+        for r, full in want.items():
+            target = os.path.join(dest, r)
+            if not os.path.exists(target):
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(full, target)
+        have = self._files(dest)                           # verify
+        if set(have) != set(want) or any(not self._same(want[r], have[r]) for r in want):
+            raise SyncError("The copy in the shared folder doesn't match after saving. Try again.")
+
+    def pull_tree(self, rel, local):
+        self._check()
+        for r, full in self._files(self._p(rel)).items():
+            target = os.path.join(local, r)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(full, target)
+
+    def copy_up(self, local, rel):
+        self._check()
+        shutil.copytree(local, self._p(rel), dirs_exist_ok=True)
+
+    def copy_down(self, rel, local):
+        self._check()
+        shutil.copytree(self._p(rel), local, dirs_exist_ok=True)
+
+    def purge(self, rel):
+        shutil.rmtree(self._p(rel), ignore_errors=True)
 
 
 def sign_in(s, client_id, client_secret):
@@ -255,12 +464,10 @@ def local_version(s):
 
 
 def drive_version(s):
-    r = rc(s, "cat", f"{s.remote}/CURRENT", check=False)
-    if r.returncode == 0 and vkey(r.stdout.strip()):
-        return r.stdout.strip()
-    _raise_if_offline(r)
-    r = rc(s, "lsf", "--dirs-only", s.remote, check=False)
-    vs = [d.rstrip("/") for d in r.stdout.split() if vkey(d.rstrip("/"))]
+    cur = (s.store.read("CURRENT") or "").strip()
+    if vkey(cur):
+        return cur
+    vs = [d for d in s.store.dirs("") if vkey(d)]
     return max(vs, key=vkey) if vs else None
 
 
@@ -407,9 +614,8 @@ def _raise_if_offline(r):
 
 
 def lock_holder(s):
-    r = rc(s, "cat", s.lock, check=False)
-    _raise_if_offline(r)
-    return (r.stdout.strip() or None) if r.returncode == 0 else None
+    text = s.store.read("LOCK")
+    return (text.strip() or None) if text is not None else None
 
 
 def holder_name(text):
@@ -424,18 +630,11 @@ def taken_time(text):
 
 
 def lock_age_hours(s):
-    r = rc(s, "lsjson", s.lock, check=False)
-    try:
-        t = json.loads(r.stdout)[0]["ModTime"]            # e.g. 2026-09-30T12:03:01.123456789+01:00
-        t = re.sub(r"\.\d+", "", t).replace("Z", "+00:00")
-        return (datetime.datetime.now(datetime.timezone.utc)
-                - datetime.datetime.fromisoformat(t)).total_seconds() / 3600
-    except Exception:
-        return 0.0
+    return s.store.age_hours("LOCK")
 
 
 def write_lock(s, taken):
-    rc(s, "rcat", s.lock, input=f"{s.rig} | taken {taken} | last seen {now()}\n")
+    s.store.write("LOCK", f"{s.rig} | taken {taken} | last seen {now()}\n")
 
 
 def mark_holding(s, on):
@@ -455,24 +654,20 @@ def was_holding(s):
 def upload(s, version, dest=None):
     """Snapshot `version` and upload it (to the main copy by default).
 
-    Only changed files are sent (compared by checksum); anything replaced on
-    Drive is kept in history/ so you can roll back.
+    `dest` is a path inside the Companion Sync folder. Only changed files are
+    sent; anything replaced in the main copy is kept in history/ so you can
+    roll back.
     """
-    main = f"{s.remote}/{version}"
+    main = version
     dest = dest or main
     with tempfile.TemporaryDirectory() as tmp:
         up = os.path.join(tmp, version)
         snapshot(s, version, up)
-        cmd = ["sync", up, dest, "--checksum", "--exclude", EXCLUDE]
-        if dest == main:
-            cmd += ["--backup-dir", f"{s.remote}/history/{now()}_{s.rig}"]
-        rc(s, *cmd)
-        rc(s, "check", up, dest, "--exclude", EXCLUDE)
+        s.store.push_tree(up, dest, f"history/{now()}_{s.rig}" if dest == main else None)
     if dest == main:
-        rc(s, "rcat", f"{s.remote}/CURRENT", input=version + "\n")
-    r = rc(s, "lsf", "--dirs-only", f"{s.remote}/history", check=False)
-    for d in sorted(r.stdout.split())[:-s.keep_history]:
-        rc(s, "purge", f"{s.remote}/history/{d.rstrip('/')}", check=False)
+        s.store.write("CURRENT", version + "\n")
+    for d in sorted(s.store.dirs("history"))[:-s.keep_history]:
+        s.store.purge(f"history/{d}")
 
 
 # ---- modules ---------------------------------------------------------------
@@ -496,9 +691,7 @@ def _local_module_folders(s, sub):
 
 
 def _drive_module_folders(s, sub):
-    r = rc(s, "lsf", "--dirs-only", f"{s.remote}/modules/{sub}", check=False)
-    _raise_if_offline(r)
-    return sorted(d.rstrip("/") for d in r.stdout.split() if MODULE_FOLDER_RE.match(d.rstrip("/")))
+    return sorted(d for d in s.store.dirs(f"modules/{sub}", strict=True) if MODULE_FOLDER_RE.match(d))
 
 
 def _copy_folder(s, src, dst):
@@ -523,9 +716,9 @@ def upload_modules(s):
                 _copy_folder(s, os.path.join(s.base, sub, name), staged)
                 if s.platform == "pi":
                     run(["sudo", "chown", "-R", os.environ.get("USER", "root"), os.path.join(tmp, sub)])
-                rc(s, "copy", staged, f"{s.remote}/modules/{sub}/{name}")
+                s.store.copy_up(staged, f"modules/{sub}/{name}")
                 added.append(name)
-    if added or rc(s, "lsf", f"{s.remote}/modules/modules.json", check=False).returncode != 0:
+    if added or not s.store.exists("modules/modules.json"):
         _write_modules_list(s)
     return added
 
@@ -536,7 +729,7 @@ def _write_modules_list(s):
         for name in _drive_module_folders(s, sub):
             m = MODULE_FOLDER_RE.match(name)
             listing["modules"].append({"type": kind, "id": m.group(1), "version": m.group(2), "folder": f"{sub}/{name}"})
-    rc(s, "rcat", f"{s.remote}/modules/modules.json", input=json.dumps(listing, indent=2) + "\n")
+    s.store.write("modules/modules.json", json.dumps(listing, indent=2) + "\n")
 
 
 def download_modules(s):
@@ -549,7 +742,7 @@ def download_modules(s):
                 if name in have:
                     continue
                 dl = os.path.join(tmp, sub, name)
-                rc(s, "copy", f"{s.remote}/modules/{sub}/{name}", dl)
+                s.store.copy_down(f"modules/{sub}/{name}", dl)
                 if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
                     s.log(f"Skipped module {name}: incomplete on Google Drive")
                     continue
@@ -574,7 +767,7 @@ def _modules_step(s, fn, verb):
 
 
 def _save_stranded(s, holder):
-    upload(s, local_version(s), f"{s.remote}/stranded/{s.rig}")
+    upload(s, local_version(s), f"stranded/{s.rig}")
     return (f"NOT saved to the main copy: the config was taken over by {holder_name(holder) or 'nobody'}.\n"
             f"This rig's version is safe on Google Drive in {s.folder}/stranded/{s.rig}.")
 
@@ -629,7 +822,7 @@ def take(s, confirm_takeover=None, manage_companion=True):
         with tempfile.TemporaryDirectory() as tmp:
             dl = os.path.join(tmp, dv)
             s.log("Downloading config from Google Drive...")
-            rc(s, "copy", f"{s.remote}/{dv}", dl, "--exclude", EXCLUDE)
+            s.store.pull_tree(dv, dl)
             if not os.path.exists(os.path.join(dl, "db.sqlite")):
                 raise SyncError("The config on Google Drive looks incomplete (no db.sqlite).")
             install_config(s, dv, dl)
@@ -693,7 +886,7 @@ def return_(s):
     lv = local_version(s)
     upload(s, lv)
     _modules_step(s, upload_modules, "uploaded")
-    rc(s, "deletefile", s.lock)
+    s.store.delete("LOCK")
     mark_holding(s, False)
     record_ok(s, "return")
     return f"Config returned and unlocked. Changes made on {s.rig} from now on won't be kept."
