@@ -18,6 +18,7 @@ import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import engine as E  # noqa: E402
+from fake_github import FakeGitHub  # noqa: E402
 
 E.stop_companion = lambda s: None
 E.start_companion = lambda s: None
@@ -57,7 +58,12 @@ class World:
         shared = os.path.join(self.tmp, "shared")
         os.makedirs(shared)
         extra = {}
-        if kind == "rclone":
+        self.github = None
+        if kind == "github":
+            self.github = FakeGitHub()
+            extra = dict(storage="github", github_repo=self.github.repo, github_client_id="test-client",
+                         github_http=self.github)
+        elif kind == "rclone":
             conf = os.path.join(self.tmp, "rclone.conf")
             with open(conf, "w") as f:
                 f.write(f"[gdrive]\ntype = alias\nremote = {shared}\n")
@@ -73,6 +79,11 @@ class World:
             os.makedirs(base)
             s = E.Settings("mac", base, os.path.join(home, "safety"), os.path.join(home, "holding"),
                            rig=name, state_file=os.path.join(home, "state.json"), log=lambda *a: None, **extra)
+            if kind == "github":
+                s.github_token_file = os.path.join(home, "github.json")
+                shown = []
+                E.github_sign_in(s, lambda code, url: shown.append((code, url)))
+                assert shown == [("ABCD-1234", "https://github.com/login/device")], shown
             self.rigs[name] = s
 
     def store_has(self, rel):
@@ -137,8 +148,10 @@ def t_save_keeps_history(w):
     time.sleep(1.1)                           # history folders are named to the second
     make_config(a.base, value="two")
     E.save(a)
-    hist = a.store.dirs("history")
-    assert hist, "history kept"
+    if w.kind == "github":                    # history is the repository's own commits
+        assert len(w.github.commits) >= 3
+    else:
+        assert a.store.dirs("history"), "history kept"
     b = w.rigs["bravo"]
     E.return_(a)
     make_config(b.base, value="x")
@@ -196,18 +209,36 @@ def t_unreachable(w):
     a = w.rigs["alpha"]
     if w.kind == "folder":
         a.folder_path = os.path.join(w.tmp, "unplugged-nas")
+    elif w.kind == "github":
+        os.remove(a.github_token_file)                       # signed out
     else:
         a.rclone_remote = "nosuchremote"
     expect_error(lambda: E.lock_holder(a), "", E.Offline)
 
 
+def t_github_race(w):
+    """Someone else commits while we save: the save is rebuilt on top, nothing lost."""
+    if w.kind != "github":
+        return
+    seed(w)
+    a = w.rigs["alpha"]
+    make_config(a.base, value="three")
+    w.github.race_next_update = True
+    E.save(a)
+    b = w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="x")
+    E.take(b)
+    assert read_value(b.base) == "three"
+
+
 SCENARIOS = [t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
-             t_older_companion_refused, t_boot, t_unreachable]
+             t_older_companion_refused, t_boot, t_unreachable, t_github_race]
 
 
 def main():
-    kinds = sys.argv[1:] or ["folder", "rclone"]
+    kinds = sys.argv[1:] or ["folder", "rclone", "github"]
     failed = 0
     for kind in kinds:
         if kind == "rclone" and not shutil.which("rclone"):

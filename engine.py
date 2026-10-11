@@ -85,9 +85,14 @@ class Settings:
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
     state_file: str = ""               # last save / last problem, for the Pi panel
-    storage: str = "rclone"            # 'rclone' (Google Drive etc.) or 'folder'
+    storage: str = "rclone"            # 'rclone' (Google Drive etc.), 'folder' or 'github'
     rclone_remote: str = REMOTE_NAME   # which rclone remote, when storage is 'rclone'
     folder_path: str = ""              # the shared folder, when storage is 'folder'
+    github_repo: str = ""              # 'owner/name', when storage is 'github'
+    github_branch: str = "main"
+    github_token_file: str = ""        # sign-in from GitHub's code sign-in (see github_sign_in)
+    github_client_id: str = ""         # the registered GitHub app that does the sign-in
+    github_http: object = None         # tests only: stands in for the GitHub API
     companion_app: str = ""            # desktop: what to launch
     keep_local: int = 5
     keep_history: int = 30
@@ -104,6 +109,8 @@ class Settings:
         settings with different rclone flags (the Pi panel) behaves accordingly."""
         if self.storage == "folder":
             return FolderStorage(self.folder_path)
+        if self.storage == "github":
+            return GitHubStorage(self)
         return RcloneStorage(self)
 
 
@@ -427,6 +434,313 @@ class FolderStorage:
 
     def purge(self, rel):
         shutil.rmtree(self._p(rel), ignore_errors=True)
+
+
+# ---- GitHub ----------------------------------------------------------------
+# A private repository per user. Every change is one commit, so history comes
+# from git itself (no history/ folder). Updates refuse to land if someone else
+# committed in between; the change is then rebuilt on top and tried again.
+
+GITHUB_API = "https://api.github.com"
+GITHUB_WEB = "https://github.com"
+
+
+def _git_blob_sha(data):
+    import hashlib
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _http_json(method, url, body=None, headers=None, form=False):
+    """(status, parsed body). Network trouble raises Offline."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    data = None
+    hdrs = {"Accept": "application/vnd.github+json", "User-Agent": "companion-sync",
+            "X-GitHub-Api-Version": "2022-11-28"}
+    hdrs.update(headers or {})
+    if body is not None:
+        if form:
+            data = urllib.parse.urlencode(body).encode()
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+            hdrs["Accept"] = "application/json"
+        else:
+            data = json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"message": raw.decode(errors="replace")[:300]}
+    except (urllib.error.URLError, OSError) as e:
+        raise Offline(f"Can't reach GitHub. Are you online?\n{e}")
+
+
+def _read_token(s):
+    try:
+        with open(s.github_token_file) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_token(s, tok):
+    if "expires_in" in tok:                      # GitHub App tokens expire; keep a refresh token
+        tok["expires_at"] = time.time() + int(tok["expires_in"]) - 60
+    os.makedirs(os.path.dirname(s.github_token_file) or ".", exist_ok=True)
+    tmp = s.github_token_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tok, f)
+    if not WIN:
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, s.github_token_file)
+
+
+def github_sign_in(s, show_code, http=None):
+    """GitHub's code sign-in: show_code(code, address) is called once, for the
+    person to open the address (phone or computer) and type the code. Blocks
+    until they've approved it (or it times out) and saves the sign-in."""
+    http = http or s.github_http or _http_json
+    if not s.github_client_id:
+        raise SyncError("This build has no GitHub sign-in details.")
+    st, d = http("POST", f"{GITHUB_WEB}/login/device/code",
+                 {"client_id": s.github_client_id, "scope": "repo"}, form=True)
+    if st != 200 or "device_code" not in (d or {}):
+        raise SyncError(f"GitHub didn't start the sign-in: {(d or {}).get('error_description', st)}")
+    show_code(d["user_code"], d["verification_uri"])
+    interval, deadline = int(d.get("interval", 5)), time.time() + int(d.get("expires_in", 900))
+    while time.time() < deadline:
+        time.sleep(interval)
+        st, t = http("POST", f"{GITHUB_WEB}/login/oauth/access_token",
+                     {"client_id": s.github_client_id, "device_code": d["device_code"],
+                      "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}, form=True)
+        err = (t or {}).get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err:
+            raise SyncError(f"GitHub sign-in didn't complete: {t.get('error_description', err)}")
+        _save_token(s, t)
+        return
+    raise SyncError("The GitHub sign-in code expired. Try again.")
+
+
+class GitHubStorage:
+    def __init__(self, s):
+        self.s = s
+        self.http = s.github_http or _http_json
+        self.root = s.folder.strip("/")
+
+    # -- plumbing --
+    def describe(self):
+        return f"github.com/{self.s.github_repo}"
+
+    def _token(self):
+        tok = _read_token(self.s)
+        if not tok or "access_token" not in tok:
+            raise Offline("Not signed in to GitHub yet.")
+        if tok.get("expires_at") and time.time() > tok["expires_at"] and tok.get("refresh_token"):
+            st, t = self.http("POST", f"{GITHUB_WEB}/login/oauth/access_token",
+                              {"client_id": self.s.github_client_id, "grant_type": "refresh_token",
+                               "refresh_token": tok["refresh_token"]}, form=True)
+            if st != 200 or "access_token" not in (t or {}):
+                raise Offline("GitHub sign-in has expired. Sign in again.")
+            _save_token(self.s, t)
+            tok = t
+        return tok["access_token"]
+
+    def _api(self, method, path, body=None, ok=(200, 201)):
+        st, d = self.http(method, f"{GITHUB_API}/repos/{self.s.github_repo}{path}", body,
+                          {"Authorization": f"Bearer {self._token()}"})
+        if st == 401:
+            raise Offline("GitHub sign-in has expired or was removed. Sign in again.")
+        if st in ok:
+            return st, d
+        if st in (404, 409):
+            return st, d
+        if st >= 500:
+            raise Offline(f"GitHub is having trouble ({st}). Try again shortly.")
+        raise SyncError(f"GitHub said no ({st}): {(d or {}).get('message', '')}")
+
+    def _full(self, rel):
+        return "/".join(p for p in (self.root, rel.strip("/")) if p)
+
+    def _head(self):
+        """(commit sha, tree sha), or (None, None) for an empty repository."""
+        st, ref = self._api("GET", f"/git/ref/heads/{self.s.github_branch}")
+        if st in (404, 409):
+            st2, _ = self._api("GET", "")
+            if st2 == 404:
+                raise Offline(f"Can't find the GitHub repository {self.s.github_repo} "
+                              f"(or this sign-in can't see it).")
+            return None, None
+        sha = ref["object"]["sha"]
+        _, c = self._api("GET", f"/git/commits/{sha}")
+        return sha, c["tree"]["sha"]
+
+    def _tree(self):
+        """{full path: blob sha} for every file in the branch."""
+        _, tree = self._head()
+        if not tree:
+            return {}
+        _, t = self._api("GET", f"/git/trees/{tree}?recursive=1")
+        return {e["path"]: e["sha"] for e in t.get("tree", []) if e["type"] == "blob"}
+
+    def _blob(self, sha):
+        import base64
+        _, b = self._api("GET", f"/git/blobs/{sha}")
+        return base64.b64decode(b["content"])
+
+    def _commit(self, changes, message):
+        """changes: {full path: bytes, or None to delete}. One commit; retried on a race."""
+        import base64
+        for attempt in range(4):
+            head, base_tree = self._head()
+            existing = self._tree() if head else {}
+            entries = []
+            for path, data in sorted(changes.items()):
+                if data is None:
+                    if path in existing:
+                        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+                    continue
+                sha = _git_blob_sha(data)
+                if existing.get(path) == sha:
+                    continue
+                _, b = self._api("POST", "/git/blobs",
+                                 {"content": base64.b64encode(data).decode(), "encoding": "base64"})
+                entries.append({"path": path, "mode": "100644", "type": "blob", "sha": b["sha"]})
+            if not entries:
+                return
+            tree_body = {"tree": entries}
+            if base_tree:
+                tree_body["base_tree"] = base_tree
+            _, t = self._api("POST", "/git/trees", tree_body)
+            _, c = self._api("POST", "/git/commits",
+                             {"message": message, "tree": t["sha"], "parents": [head] if head else []})
+            if head:
+                st, _ = self._api("PATCH", f"/git/refs/heads/{self.s.github_branch}",
+                                  {"sha": c["sha"], "force": False}, ok=(200, 422))
+            else:
+                st, _ = self._api("POST", "/git/refs",
+                                  {"ref": f"refs/heads/{self.s.github_branch}", "sha": c["sha"]}, ok=(201, 422))
+            if st in (200, 201):
+                return
+            time.sleep(1 + attempt)                     # someone else committed: rebuild on theirs
+        raise SyncError("GitHub kept changing underneath this save. Try again.")
+
+    # -- the storage interface --
+    def signed_in(self):
+        if not _read_token(self.s):
+            return False
+        try:
+            st, _ = self._api("GET", "")
+            return st == 200
+        except (Offline, SyncError):
+            return False
+
+    def read(self, rel):
+        sha = self._tree().get(self._full(rel))
+        return self._blob(sha).decode("utf-8") if sha else None
+
+    def write(self, rel, text):
+        self._commit({self._full(rel): text.encode("utf-8")}, f"{self.s.rig}: {rel}")
+
+    def delete(self, rel):
+        self._commit({self._full(rel): None}, f"{self.s.rig}: remove {rel}")
+
+    def age_hours(self, rel):
+        try:
+            st, cs = self._api("GET", f"/commits?path={self._full(rel)}&sha={self.s.github_branch}&per_page=1")
+            t = cs[0]["commit"]["committer"]["date"].replace("Z", "+00:00")
+            return (datetime.datetime.now(datetime.timezone.utc)
+                    - datetime.datetime.fromisoformat(t)).total_seconds() / 3600
+        except (Offline, SyncError, IndexError, KeyError, TypeError):
+            return 0.0
+
+    def dirs(self, rel, strict=False):
+        try:
+            tree = self._tree()
+        except Offline:
+            if strict:
+                raise
+            return []
+        pre = self._full(rel)
+        pre = pre + "/" if pre else ""
+        return sorted({p[len(pre):].split("/")[0] for p in tree
+                       if p.startswith(pre) and "/" in p[len(pre):]})
+
+    def exists(self, rel):
+        full = self._full(rel)
+        return any(p == full or p.startswith(full + "/") for p in self._tree())
+
+    def _local_files(self, local, skip_backups):
+        files = {}
+        for root, dirs, names in os.walk(local):
+            if skip_backups and root == local:
+                dirs[:] = [d for d in dirs if d != "backups"]
+            for n in names:
+                full = os.path.join(root, n)
+                files[os.path.relpath(full, local).replace(os.sep, "/")] = full
+        return files
+
+    def push_tree(self, local, rel, backup_rel=None):
+        # backup_rel isn't needed: the previous version stays in the repository's history
+        pre = self._full(rel) + "/"
+        want = self._local_files(local, skip_backups=True)
+        changes = {}
+        for r, full in want.items():
+            with open(full, "rb") as f:
+                changes[pre + r] = f.read()
+        for p in self._tree():
+            if p.startswith(pre) and p[len(pre):] not in want and not p[len(pre):].startswith("backups/"):
+                changes[p] = None
+        self._commit(changes, f"{self.s.rig}: save {rel}")
+        have = self._tree()                                     # verify
+        for r, data_path in want.items():
+            with open(data_path, "rb") as f:
+                if have.get(pre + r) != _git_blob_sha(f.read()):
+                    raise SyncError("The copy on GitHub doesn't match after saving. Try again.")
+
+    def _pull(self, rel, local, skip_backups):
+        pre = self._full(rel) + "/"
+        for p, sha in self._tree().items():
+            if not p.startswith(pre):
+                continue
+            r = p[len(pre):]
+            if skip_backups and r.startswith("backups/"):
+                continue
+            target = os.path.join(local, *r.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(self._blob(sha))
+
+    def pull_tree(self, rel, local):
+        self._pull(rel, local, skip_backups=True)
+
+    def copy_up(self, local, rel):
+        pre = self._full(rel) + "/"
+        changes = {}
+        for r, full in self._local_files(local, skip_backups=False).items():
+            with open(full, "rb") as f:
+                changes[pre + r] = f.read()
+        self._commit(changes, f"{self.s.rig}: add {rel}")
+
+    def copy_down(self, rel, local):
+        self._pull(rel, local, skip_backups=False)
+
+    def purge(self, rel):
+        pre = self._full(rel) + "/"
+        gone = {p: None for p in self._tree() if p.startswith(pre)}
+        if gone:
+            self._commit(gone, f"{self.s.rig}: remove {rel}")
 
 
 def sign_in(s, client_id, client_secret):
