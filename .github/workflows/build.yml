@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller pystray pillow
+      - run: pip install pyinstaller pystray pillow cryptography
       - name: Get rclone
         shell: pwsh
         run: |
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller pystray pillow
+      - run: pip install pyinstaller pystray pillow cryptography
       - name: Get rclone
         run: |
           curl -sSL -o rc.zip https://downloads.rclone.org/rclone-current-osx-arm64.zip

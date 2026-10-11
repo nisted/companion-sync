@@ -78,7 +78,8 @@ class World:
             base = os.path.join(home, "companion")
             os.makedirs(base)
             s = E.Settings("mac", base, os.path.join(home, "safety"), os.path.join(home, "holding"),
-                           rig=name, state_file=os.path.join(home, "state.json"), log=lambda *a: None, **extra)
+                           rig=name, state_file=os.path.join(home, "state.json"),
+                           key_file=os.path.join(home, "key.json"), log=lambda *a: None, **extra)
             if kind == "github":
                 s.github_token_file = os.path.join(home, "github.json")
                 shown = []
@@ -326,7 +327,69 @@ def t_github_connect(w):
     assert "Reading and writing both work" in E.check_storage(a)
 
 
-SCENARIOS = [t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def stored_bytes(w):
+    """Every file's bytes as the storage holds them now (not history, for GitHub)."""
+    a = w.rigs["alpha"]
+    if w.kind == "github":
+        files = a.store._tree()
+        return {p: a.store._blob(sha) for p, sha in files.items()}
+    out = {}
+    for root, _, files in os.walk(w.shared):
+        for f in files:
+            with open(os.path.join(root, f), "rb") as fh:
+                out[os.path.relpath(os.path.join(root, f), w.shared)] = fh.read()
+    return out
+
+
+SECRET = "secret-password-in-config"
+PASS = "correct horse battery"
+
+
+def t_encryption(w):
+    """Turned on: nothing readable leaves the rig, other rigs need the passphrase, saves stay small."""
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    make_config(a.base, value=SECRET)
+    E.write_lock(a, E.now()); E.mark_holding(a, True); E.save(a)
+    add_module(a.base, "custom-thing-1.0.0")
+    E.save(a)
+    assert any(SECRET.encode() in v for v in stored_bytes(w).values()), "test can't see plain text"
+    expect_error(lambda: E.turn_on_encryption(b, PASS), "only the rig")
+    expect_error(lambda: E.turn_on_encryption(a, "short"), "at least")
+    E.turn_on_encryption(a, PASS)
+    stored = stored_bytes(w)
+    assert not any(SECRET.encode() in v for v in stored.values()), "plain config left in the storage"
+    assert any(p.endswith("db.sqlite.enc") for p in stored), sorted(stored)
+    assert not any(p.endswith("db.sqlite") for p in stored), "an old build must not find a plain db.sqlite"
+    before = dict(stored)
+    E.save(a)                                     # nothing changed: same encrypted bytes
+    after = stored_bytes(w)
+    assert {p: v for p, v in after.items() if p.endswith(".enc")} == {p: v for p, v in before.items() if p.endswith(".enc")}
+    E.return_(a)
+    make_config(b.base, value="bravo old")
+    expect_error(lambda: E.take(b), "passphrase", E.NeedsPassphrase)
+    expect_error(lambda: E.unlock(b, "wrong passphrase!"), "isn't right")
+    E.unlock(b, PASS)
+    E.take(b)
+    assert read_value(b.base) == SECRET
+    assert os.path.exists(os.path.join(b.base, "modules", "custom-thing-1.0.0", "companion", "manifest.json"))
+    assert "This rig has the passphrase" in E.check_storage(b)
+
+
+def t_encryption_off(w):
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    make_config(a.base, value=SECRET)
+    E.write_lock(a, E.now()); E.mark_holding(a, True); E.save(a)
+    E.turn_on_encryption(a, PASS)
+    E.turn_off_encryption(a)
+    stored = stored_bytes(w)
+    assert not any(p.endswith(".enc") for p in stored) and not E.encryption_on(a), sorted(stored)
+    E.return_(a)
+    make_config(b.base, value="x")
+    E.take(b)                                     # no passphrase needed now
+    assert read_value(b.base) == SECRET
+
+
+SCENARIOS = [t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

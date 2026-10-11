@@ -98,6 +98,7 @@ class Settings:
     github_repo: str = ""              # 'owner/name', when storage is 'github'
     github_branch: str = "main"
     github_token_file: str = ""        # sign-in from GitHub's code sign-in (see github_sign_in)
+    key_file: str = ""                 # this rig's copy of the encryption key, when encryption is on
     github_client_id: str = ""         # the registered GitHub app that does the sign-in
     github_mode: str = "limited"       # 'limited' (GitHub App, one chosen repo) or 'quick' (OAuth app, makes the repo)
     github_app_slug: str = ""          # the GitHub App's name in its web address, for the 'limited' install link
@@ -191,6 +192,7 @@ def default_settings(**kw):
     s.state_file = os.path.join(home, ".companion-sync-state.json")
     s.storage_file = os.path.join(home, ".companion-sync-storage.json")
     s.github_token_file = os.path.join(home, ".companion-sync-github.json")
+    s.key_file = os.path.join(home, ".companion-sync-key.json")
     for k, v in kw.items():
         setattr(s, k, v)
     load_storage_choice(s)
@@ -451,6 +453,263 @@ class FolderStorage:
 
     def purge(self, rel):
         shutil.rmtree(self._p(rel), ignore_errors=True)
+
+
+# ---- encryption (optional, off by default) ----------------------------------
+# When it's on, every config and module file is encrypted on the rig before it
+# leaves, so the storage only ever holds scrambled copies, named '<file>.enc'.
+# (An older Companion Sync then finds no db.sqlite and refuses, rather than
+# installing scrambled files.) LOCK, CURRENT, checks/ and modules.json stay
+# readable: they hold rig names and versions, nothing from the config.
+#
+# The key comes from a passphrase (scrypt), typed once on each rig and kept in
+# s.key_file. The ENCRYPTED file in the storage holds the salt and a check
+# value, so a wrong passphrase is caught straight away. The same file always
+# encrypts to the same bytes (the nonce is derived from its content), so
+# unchanged files aren't uploaded again on every save.
+
+ENC_MARKER = "ENCRYPTED"
+ENC_SUFFIX = ".enc"
+ENC_MAGIC = b"CSENC1"
+ENC_MIN_PASSPHRASE = 10
+
+
+class NeedsPassphrase(SyncError):
+    """The storage is encrypted and this rig hasn't been given the passphrase."""
+
+
+def _b64(b):
+    import base64
+    return base64.b64encode(b).decode()
+
+
+def _unb64(t):
+    import base64
+    return base64.b64decode(t)
+
+
+def _derive_key(passphrase, salt, n=2 ** 15, r=8, p=1):
+    import hashlib
+    return hashlib.scrypt(passphrase.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                          maxmem=128 * 1024 * 1024, dklen=64)
+
+
+class Cipher:
+    def __init__(self, key):
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        except ImportError:
+            raise SyncError("This copy of Companion Sync can't do encryption (the 'cryptography' "
+                            "package is missing).")
+        self.aes, self.nonce_key = AESGCM(key[:32]), key[32:]
+
+    def seal(self, name, data):
+        import hashlib
+        import hmac
+        nonce = hmac.new(self.nonce_key, name.encode() + b"\0" + data, hashlib.sha256).digest()[:12]
+        return ENC_MAGIC + nonce + self.aes.encrypt(nonce, data, name.encode())
+
+    def open(self, name, blob):
+        if not blob.startswith(ENC_MAGIC):
+            raise SyncError(f"{name} isn't a Companion Sync encrypted file.")
+        n = len(ENC_MAGIC)
+        try:
+            return self.aes.decrypt(blob[n:n + 12], blob[n + 12:], name.encode())
+        except Exception:
+            raise SyncError(f"Couldn't decrypt {name}: the passphrase is wrong or the file is damaged.")
+
+
+def _walk_files(top):
+    for root, dirs, files in os.walk(top):
+        if root == top:
+            dirs[:] = [d for d in dirs if d != "backups"]
+        for f in files:
+            full = os.path.join(root, f)
+            yield os.path.relpath(full, top).replace(os.sep, "/"), full
+
+
+def _seal_tree(cipher, src, dst):
+    for rel, full in _walk_files(src):
+        out = os.path.join(dst, *rel.split("/")) + ENC_SUFFIX
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(full, "rb") as f:
+            data = f.read()
+        with open(out, "wb") as f:
+            f.write(cipher.seal(rel, data))
+
+
+def _open_tree(cipher, src, dst):
+    """Decrypt '.enc' files; anything else (from before encryption) is copied as it is."""
+    for rel, full in _walk_files(src):
+        plain = rel[:-len(ENC_SUFFIX)] if rel.endswith(ENC_SUFFIX) else rel
+        out = os.path.join(dst, *plain.split("/"))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(full, "rb") as f:
+            data = f.read()
+        with open(out, "wb") as f:
+            f.write(cipher.open(plain, data) if plain != rel else data)
+
+
+class EncryptedStorage:
+    """Wraps a storage: folders of files go in and out encrypted; the small
+    readable files (LOCK, CURRENT...) pass straight through."""
+
+    def __init__(self, inner, cipher):
+        self.inner, self.cipher = inner, cipher
+
+    def __getattr__(self, name):                 # read, write, delete, dirs, exists, purge...
+        return getattr(self.inner, name)
+
+    def push_tree(self, local, rel, backup_rel=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            _seal_tree(self.cipher, local, tmp)
+            self.inner.push_tree(tmp, rel, backup_rel)
+
+    def pull_tree(self, rel, local):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.inner.pull_tree(rel, tmp)
+            _open_tree(self.cipher, tmp, local)
+
+    def copy_up(self, local, rel):
+        with tempfile.TemporaryDirectory() as tmp:
+            _seal_tree(self.cipher, local, tmp)
+            self.inner.copy_up(tmp, rel)
+
+    def copy_down(self, rel, local):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.inner.copy_down(rel, tmp)
+            _open_tree(self.cipher, tmp, local)
+
+
+def encryption_marker(s):
+    text = s.store.read(ENC_MARKER)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise SyncError(f"The {ENC_MARKER} file in {s.place} is damaged.")
+
+
+def _saved_key(s, marker):
+    try:
+        with open(s.key_file) as f:
+            k = json.load(f)
+        if k.get("salt") == marker["salt"]:
+            return _unb64(k["key"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _save_key(s, salt_b64, key):
+    tmp = s.key_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"salt": salt_b64, "key": _b64(key)}, f)
+    if not WIN:
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, s.key_file)
+
+
+def _check_key(marker, key):
+    try:
+        return Cipher(key).open("check", _unb64(marker["check"])) == b"companion-sync"
+    except SyncError as e:
+        if "can't do encryption" in str(e):
+            raise
+        return False
+
+
+def data_store(s):
+    """The storage to move config and module files through: encrypted if the
+    storage says so (asking for the passphrase if this rig doesn't have it)."""
+    store = s.store
+    marker = encryption_marker(s)
+    if not marker:
+        return store
+    key = _saved_key(s, marker)
+    if key is None:
+        raise NeedsPassphrase(f"The config in {s.place} is encrypted. "
+                              f"Enter its passphrase on this rig to use it.")
+    return EncryptedStorage(store, Cipher(key))
+
+
+def encryption_on(s):
+    return encryption_marker(s) is not None
+
+
+def unlock(s, passphrase):
+    """Give this rig the passphrase for encrypted storage. Raises if it's wrong."""
+    marker = encryption_marker(s)
+    if not marker:
+        raise SyncError(f"The config in {s.place} isn't encrypted.")
+    key = _derive_key(passphrase, _unb64(marker["salt"]), marker["n"], marker["r"], marker["p"])
+    if not _check_key(marker, key):
+        raise SyncError("That passphrase isn't right.")
+    _save_key(s, marker["salt"], key)
+
+
+def _recode_storage(s, old, new):
+    """Rewrite everything in the storage from `old` to `new` (plain or encrypted):
+    this rig's config is uploaded afresh, modules are re-encoded, and history
+    and stranded copies (in the old form) are removed."""
+    lv = local_version(s)
+    for d in s.store.dirs(""):
+        if vkey(d) or d in ("history", "stranded"):
+            s.store.purge(d)
+    with tempfile.TemporaryDirectory() as tmp:
+        up = os.path.join(tmp, "config", lv)
+        snapshot(s, lv, up)
+        new.push_tree(up, lv)
+        for sub in MODULE_KINDS:
+            for name in _drive_module_folders(s, sub):
+                here = os.path.join(tmp, "modules", sub, name)
+                old.copy_down(f"modules/{sub}/{name}", here)
+                s.store.purge(f"modules/{sub}/{name}")
+                new.copy_up(here, f"modules/{sub}/{name}")
+    s.store.write("CURRENT", lv + "\n")
+
+
+def _must_hold(s, what):
+    if holder_name(lock_holder(s)) != s.rig:
+        raise SyncError(f"Only the rig that has the config can {what}. Take the config first.")
+
+
+def turn_on_encryption(s, passphrase):
+    """Encrypt the shared config from now on. This rig must have the config."""
+    if len(passphrase) < ENC_MIN_PASSPHRASE:
+        raise SyncError(f"Use a passphrase of at least {ENC_MIN_PASSPHRASE} characters.")
+    if encryption_on(s):
+        raise SyncError(f"The config in {s.place} is already encrypted.")
+    _must_hold(s, "turn on encryption")
+    Cipher(b"\0" * 64)                                       # fails early if encryption isn't available
+    salt = os.urandom(16)
+    key = _derive_key(passphrase, salt)
+    marker = {"version": 1, "kdf": "scrypt", "n": 2 ** 15, "r": 8, "p": 1, "salt": _b64(salt),
+              "check": _b64(Cipher(key).seal("check", b"companion-sync"))}
+    _save_key(s, marker["salt"], key)
+    plain, sealed = s.store, EncryptedStorage(s.store, Cipher(key))
+    s.store.write(ENC_MARKER, json.dumps(marker, indent=1) + "\n")
+    _recode_storage(s, plain, sealed)
+    record_ok(s, "save")
+    note = ("\n\nGitHub keeps every earlier version in the repository's history, including the "
+            "unencrypted ones. To be rid of those, make a new private repository and choose it in Storage…."
+            if s.storage == "github" else "")
+    return (f"The config in {s.place} is now encrypted. Other rigs will ask for the passphrase "
+            f"the first time they use it.\n\nKeep the passphrase safe: without it the config in "
+            f"{s.place} can't be read (each rig still has its own copy).{note}")
+
+
+def turn_off_encryption(s):
+    """Store the shared config unencrypted again. This rig must have the config and the passphrase."""
+    if not encryption_on(s):
+        raise SyncError(f"The config in {s.place} isn't encrypted.")
+    _must_hold(s, "turn off encryption")
+    sealed = data_store(s)
+    _recode_storage(s, sealed, s.store)
+    s.store.delete(ENC_MARKER)
+    record_ok(s, "save")
+    return f"The config in {s.place} is no longer encrypted."
 
 
 # ---- GitHub ----------------------------------------------------------------
@@ -1168,10 +1427,11 @@ def upload(s, version, dest=None):
     """
     main = version
     dest = dest or main
+    store = data_store(s)
     with tempfile.TemporaryDirectory() as tmp:
         up = os.path.join(tmp, version)
         snapshot(s, version, up)
-        s.store.push_tree(up, dest, f"history/{now()}_{s.rig}" if dest == main else None)
+        store.push_tree(up, dest, f"history/{now()}_{s.rig}" if dest == main else None)
     if dest == main:
         s.store.write("CURRENT", version + "\n")
     for d in sorted(s.store.dirs("history"))[:-s.keep_history]:
@@ -1214,6 +1474,7 @@ def _copy_folder(s, src, dst):
 def upload_modules(s):
     """Upload installed module versions the storage doesn't have yet. Returns their names."""
     added = []
+    store = data_store(s)
     with tempfile.TemporaryDirectory() as tmp:
         for sub in MODULE_KINDS:
             have = set(_drive_module_folders(s, sub))
@@ -1224,7 +1485,7 @@ def upload_modules(s):
                 _copy_folder(s, os.path.join(s.base, sub, name), staged)
                 if s.platform == "pi":
                     run(["sudo", "chown", "-R", os.environ.get("USER", "root"), os.path.join(tmp, sub)])
-                s.store.copy_up(staged, f"modules/{sub}/{name}")
+                store.copy_up(staged, f"modules/{sub}/{name}")
                 added.append(name)
     if added or not s.store.exists("modules/modules.json"):
         _write_modules_list(s)
@@ -1243,6 +1504,7 @@ def _write_modules_list(s):
 def download_modules(s):
     """Copy in module versions this rig is missing. Companion must be stopped. Returns their names."""
     added = []
+    store = data_store(s)
     with tempfile.TemporaryDirectory() as tmp:
         for sub in MODULE_KINDS:
             have = set(_local_module_folders(s, sub))
@@ -1250,7 +1512,7 @@ def download_modules(s):
                 if name in have:
                     continue
                 dl = os.path.join(tmp, sub, name)
-                s.store.copy_down(f"modules/{sub}/{name}", dl)
+                store.copy_down(f"modules/{sub}/{name}", dl)
                 if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
                     s.log(f"Skipped module {name}: incomplete in {s.place}")
                     continue
@@ -1324,13 +1586,14 @@ def take(s, confirm_takeover=None, manage_companion=True):
     if vkey(dv) > vkey(lv):
         raise NeedsUpdate(f"The config in {s.place} is from Companion {vtext(dv)}, but this rig "
                         f"has Companion {vtext(lv)}.\nUpdate Companion on this rig first.")
+    store = data_store(s)                      # encrypted? needs the passphrase before anything stops
     if manage_companion:
         stop_companion(s)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dl = os.path.join(tmp, dv)
             s.log(f"Downloading config from {s.place}...")
-            s.store.pull_tree(dv, dl)
+            store.pull_tree(dv, dl)
             if not os.path.exists(os.path.join(dl, "db.sqlite")):
                 raise SyncError(f"The config in {s.place} looks incomplete (no db.sqlite).")
             install_config(s, dv, dl)
@@ -1434,6 +1697,10 @@ def check_storage(s):
         there = f"There's a Companion {vtext(dv)} config here, held by {holder_name(h)}."
     else:
         there = f"There's a Companion {vtext(dv)} config here, free to take."
+    marker = encryption_marker(s)
+    if marker:
+        there += ("\n\nIt's encrypted. This rig has the passphrase." if _saved_key(s, marker)
+                  else "\n\nIt's encrypted: this rig will ask for the passphrase before using it.")
     return f"Connected to {s.place} ({where}). Reading and writing both work.\n\n{there}"
 
 

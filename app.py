@@ -152,6 +152,43 @@ def choose(prompt, options, title=APP):
     return picked[0] if picked else None
 
 
+def ask_secret(prompt, title=APP):
+    """Type a passphrase (hidden). Returns it, or None if cancelled."""
+    if E.MAC:
+        r = subprocess.run(["osascript", "-e",
+                            f'display dialog {_osa(prompt)} with title {_osa(title)} default answer "" '
+                            f'with hidden answer buttons {{"Cancel", "OK"}} default button "OK"'],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        out = r.stdout.strip()
+        return out.split("text returned:", 1)[1] if "text returned:" in out else None
+    import tkinter as tk
+    got = []
+    root = tk.Tk()
+    root.title(title)
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    tk.Label(root, text=prompt, justify="left", wraplength=420).pack(padx=16, pady=(14, 8), anchor="w")
+    entry = tk.Entry(root, show="\u2022", width=40)
+    entry.pack(padx=16)
+
+    def ok(*_):
+        got.append(entry.get())
+        root.destroy()
+    root.bind("<Return>", ok)
+    root.bind("<Escape>", lambda *_: root.destroy())
+    row = tk.Frame(root)
+    row.pack(pady=12, padx=16, anchor="e")
+    tk.Button(row, text="Cancel", width=10, command=root.destroy).pack(side="right", padx=(6, 0))
+    tk.Button(row, text="OK", width=10, command=ok, default="active").pack(side="right")
+    root.lift()
+    root.focus_force()
+    entry.focus_set()
+    root.mainloop()
+    return got[0] if got else None
+
+
 def pick_folder(prompt, title=APP):
     """Choose a folder. Returns its path, or None if cancelled."""
     if E.MAC:
@@ -288,6 +325,7 @@ class App:
             M(lambda i: f"Sign in to {self.s.place}…", self.bg(self.sign_in),
               visible=lambda i: not E.signed_in(self.s)),
             M(lambda i: f"Storage: {self.s.place.removeprefix('the ').capitalize()}…", self.bg(self.choose_storage)),
+            M("Encryption…", self.bg(self.encryption)),
             M("Start at login", lambda: set_login(not login_enabled()),
               checked=lambda i: login_enabled()),
             M("Open log", lambda: self.open_path(LOG_FILE)),
@@ -310,7 +348,11 @@ class App:
             return
         try:
             self.set_state("busy", "Working…")
-            fn()
+            try:
+                fn()
+            except E.NeedsPassphrase as e:          # encrypted storage: get the passphrase, then try again
+                if self.enter_passphrase(str(e)):
+                    fn()
         except E.NeedsUpdate as e:
             log.info(f"problem: {e}")
             self.offer_download(str(e))
@@ -378,6 +420,8 @@ class App:
             self.mine = True
             self.last_save = None
             self.notify(msg)
+        except E.NeedsPassphrase:
+            raise
         except E.NeedsUpdate as e:
             self.offer_download(str(e))
         except E.NoConfigYet as e:
@@ -421,6 +465,59 @@ class App:
             self.offer_download(text + f"\n\nThis rig needs Companion {E.vtext(dv)} to use the config.")
         else:
             tell(text)
+
+    def enter_passphrase(self, why):
+        """Ask for the encryption passphrase until it's right (or cancelled). True when unlocked."""
+        msg = f"{why}\n\nPassphrase:"
+        while True:
+            p = ask_secret(msg)
+            if p is None:
+                return False
+            try:
+                E.unlock(self.s, p)
+                self.notify("Passphrase accepted. This rig will remember it.")
+                return True
+            except E.SyncError as e:
+                msg = f"{e}\n\nTry again:"
+
+    def encryption(self):
+        """Turn encryption of the shared config on or off (from the rig that has it),
+        or give this rig the passphrase."""
+        if not E.encryption_on(self.s):
+            if not self.mine:
+                tell(f"The config in {self.s.place} isn't encrypted.\n\nTo turn encryption on, do it "
+                     f"on the rig that has the config (or take it here first).")
+                return
+            if not ask(f"Encrypt the shared config?\n\nEverything Companion Sync puts in {self.s.place} "
+                       f"is then scrambled with a passphrase you choose. Each rig asks for the passphrase "
+                       f"once and remembers it.\n\nIf the passphrase is lost, the copy in {self.s.place} "
+                       f"can't be read (each rig still has its own copy). Carry on?"):
+                return
+            while True:
+                p1 = ask_secret(f"Choose a passphrase (at least {E.ENC_MIN_PASSPHRASE} characters):")
+                if p1 is None:
+                    return
+                if len(p1) < E.ENC_MIN_PASSPHRASE:
+                    tell(f"That's too short. Use at least {E.ENC_MIN_PASSPHRASE} characters.")
+                    continue
+                p2 = ask_secret("Type the passphrase again:")
+                if p2 is None:
+                    return
+                if p1 == p2:
+                    break
+                tell("Those didn't match. Try again.")
+            self.set_state("busy", "Encrypting…")
+            tell(E.turn_on_encryption(self.s, p1))
+            return
+        if not self.mine:
+            if self.enter_passphrase(f"The config in {self.s.place} is encrypted."):
+                tell(f"This rig has the passphrase now.\n\nTo turn encryption off, do it on the rig "
+                     f"that has the config.")
+            return
+        if ask(f"The config in {self.s.place} is encrypted.\n\nTurn encryption off? "
+               f"It'll be stored unscrambled again."):
+            self.set_state("busy", "Decrypting…")
+            tell(E.turn_off_encryption(self.s))
 
     def update_app(self):
         tell(f"Your browser will download the latest {APP}.\n\n"

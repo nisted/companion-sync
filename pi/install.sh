@@ -24,7 +24,7 @@ say "Installing for $USER_NAME"
 
 # Packages
 need=()
-for p in python3-spidev python3-libgpiod python3-pil python3-numpy rsync; do
+for p in python3-spidev python3-libgpiod python3-pil python3-numpy python3-cryptography rsync; do
     dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
 done
 command -v rclone >/dev/null || need+=(rclone)
