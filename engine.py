@@ -548,6 +548,21 @@ def _gh_user(s, method, path, body=None):
 
 GITHUB_DEFAULT_REPO = "companion-sync-config"
 
+# The two registered GitHub apps (Client IDs are public; no secrets are used)
+GITHUB_APPS = {
+    "limited": {"client_id": "Iv23liZE4l3VNzqtCS2G", "slug": "companion-sync"},   # GitHub App
+    "quick": {"client_id": "Ov23liSTzcqDK8JcwVnn", "slug": ""},                   # OAuth App
+}
+
+
+def use_github(s, mode, repo=""):
+    """Point settings at GitHub with the chosen sign-in option."""
+    app = GITHUB_APPS[mode]
+    s.storage, s.github_mode = "github", mode
+    s.github_client_id, s.github_app_slug = app["client_id"], app["slug"]
+    if repo:
+        s.github_repo = repo
+
 
 def github_quick_setup(s, name=GITHUB_DEFAULT_REPO):
     """'Quick' option: use (or make) a private repository called `name` in the
