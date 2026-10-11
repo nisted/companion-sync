@@ -22,9 +22,14 @@ class FakeGitHub:
         self.polls = 0
         self.ids = itertools.count(1)
         self.race_next_update = False        # simulate someone else committing first
+        self.login = repo.split("/")[0]
+        self.repo_exists, self.repo_private = True, True
+        self.installed = []                  # repositories ticked when installing the GitHub App
+        self.scopes_asked = []
 
     def __call__(self, method, url, body=None, headers=None, form=False):
         if url.startswith("https://github.com/login/device/code"):
+            self.scopes_asked.append((body or {}).get("scope"))
             return 200, {"device_code": "dev1", "user_code": "ABCD-1234",
                          "verification_uri": "https://github.com/login/device", "interval": 0, "expires_in": 30}
         if url.startswith("https://github.com/login/oauth/access_token"):
@@ -34,8 +39,19 @@ class FakeGitHub:
             return 200, {"access_token": self.TOKEN, "token_type": "bearer", "scope": "repo"}
         if (headers or {}).get("Authorization") != f"Bearer {self.TOKEN}":
             return 401, {"message": "Bad credentials"}
+        api = "https://api.github.com"
+        if url == f"{api}/user":
+            return 200, {"login": self.login}
+        if url == f"{api}/user/repos" and method == "POST":
+            self.repo = f"{self.login}/{body['name']}"
+            self.repo_exists, self.repo_private = True, body["private"]
+            return 201, {"full_name": self.repo, "private": body["private"]}
+        if url == f"{api}/user/installations":
+            return 200, {"installations": [{"id": 7}] if self.installed else []}
+        if url == f"{api}/user/installations/7/repositories":
+            return 200, {"repositories": [{"full_name": r} for r in self.installed]}
         pre = f"https://api.github.com/repos/{self.repo}"
-        if not url.startswith(pre):
+        if not url.startswith(pre) or not self.repo_exists:
             return 404, {"message": "Not Found"}
         path = url[len(pre):]
         return self.route(method, path, body)
@@ -51,7 +67,7 @@ class FakeGitHub:
 
     def route(self, method, path, body):
         if method == "GET" and path == "":
-            return 200, {"full_name": self.repo, "private": True}
+            return 200, {"full_name": self.repo, "private": self.repo_private}
         if method == "GET" and path.startswith("/git/ref/heads/"):
             if not self.head:
                 return 409, {"message": "Git Repository is empty."}

@@ -232,9 +232,40 @@ def t_github_race(w):
     assert read_value(b.base) == "three"
 
 
+def t_github_quick_setup(w):
+    """Quick option: asks for repo access, makes the private repo once, then reuses it."""
+    if w.kind != "github":
+        return
+    gh, a = w.github, w.rigs["alpha"]
+    a.github_mode = "quick"
+    E.github_sign_in(a, lambda c, u: None)
+    assert gh.scopes_asked[-1] == "repo"
+    gh.repo, gh.repo_exists = "nige/companion-sync-config", False
+    assert E.github_quick_setup(a) == "nige/companion-sync-config" and gh.repo_exists and gh.repo_private
+    assert E.github_quick_setup(a) == "nige/companion-sync-config"           # already there: reused
+    gh.repo_private = False
+    expect_error(lambda: E.github_quick_setup(a), "public")                  # never use a public repo
+    gh.repo_private = True
+    seed(w)                                                                  # and it syncs
+    assert E.status(a)["holder"] == "alpha"
+
+
+def t_github_limited(w):
+    """Limited option: no repo access asked for; explains what to do until a repo is ticked."""
+    if w.kind != "github":
+        return
+    gh, a = w.github, w.rigs["alpha"]
+    assert gh.scopes_asked[0] is None, "limited sign-in asks for no repo access"
+    a.github_app_slug = "companion-sync"
+    expect_error(lambda: E.github_granted_repos(a), "github.com/apps/companion-sync/installations/new")
+    gh.installed = ["nige/companion-data"]
+    assert E.github_granted_repos(a) == ["nige/companion-data"]
+
+
 SCENARIOS = [t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
-             t_older_companion_refused, t_boot, t_unreachable, t_github_race]
+             t_older_companion_refused, t_boot, t_unreachable, t_github_race,
+             t_github_quick_setup, t_github_limited]
 
 
 def main():

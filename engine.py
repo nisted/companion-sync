@@ -92,6 +92,8 @@ class Settings:
     github_branch: str = "main"
     github_token_file: str = ""        # sign-in from GitHub's code sign-in (see github_sign_in)
     github_client_id: str = ""         # the registered GitHub app that does the sign-in
+    github_mode: str = "limited"       # 'limited' (GitHub App, one chosen repo) or 'quick' (OAuth app, makes the repo)
+    github_app_slug: str = ""          # the GitHub App's name in its web address, for the 'limited' install link
     github_http: object = None         # tests only: stands in for the GitHub API
     companion_app: str = ""            # desktop: what to launch
     keep_local: int = 5
@@ -509,8 +511,10 @@ def github_sign_in(s, show_code, http=None):
     http = http or s.github_http or _http_json
     if not s.github_client_id:
         raise SyncError("This build has no GitHub sign-in details.")
-    st, d = http("POST", f"{GITHUB_WEB}/login/device/code",
-                 {"client_id": s.github_client_id, "scope": "repo"}, form=True)
+    body = {"client_id": s.github_client_id}
+    if s.github_mode == "quick":
+        body["scope"] = "repo"                 # OAuth app: may create and use the user's repositories
+    st, d = http("POST", f"{GITHUB_WEB}/login/device/code", body, form=True)
     if st != 200 or "device_code" not in (d or {}):
         raise SyncError(f"GitHub didn't start the sign-in: {(d or {}).get('error_description', st)}")
     show_code(d["user_code"], d["verification_uri"])
@@ -531,6 +535,63 @@ def github_sign_in(s, show_code, http=None):
         _save_token(s, t)
         return
     raise SyncError("The GitHub sign-in code expired. Try again.")
+
+
+def _gh_user(s, method, path, body=None):
+    """A GitHub API call that isn't about one repository (who am I, make a repo...)."""
+    store = GitHubStorage(s)
+    st, d = store.http(method, f"{GITHUB_API}{path}", body, {"Authorization": f"Bearer {store._token()}"})
+    if st == 401:
+        raise Offline("GitHub sign-in has expired or was removed. Sign in again.")
+    return st, d
+
+
+GITHUB_DEFAULT_REPO = "companion-sync-config"
+
+
+def github_quick_setup(s, name=GITHUB_DEFAULT_REPO):
+    """'Quick' option: use (or make) a private repository called `name` in the
+    signed-in account. Sets s.github_repo and returns it."""
+    st, me = _gh_user(s, "GET", "/user")
+    if st != 200:
+        raise SyncError(f"GitHub didn't say who's signed in ({st}).")
+    full = f"{me['login']}/{name}"
+    st, repo = _gh_user(s, "GET", f"/repos/{full}")
+    if st == 404:
+        st, repo = _gh_user(s, "POST", "/user/repos",
+                            {"name": name, "private": True,
+                             "description": "Companion config shared by Companion Sync"})
+        if st not in (200, 201):
+            raise SyncError(f"Couldn't make the repository {full}: {(repo or {}).get('message', st)}")
+    elif st != 200:
+        raise SyncError(f"Couldn't check the repository {full} ({st}).")
+    elif not repo.get("private", True):
+        raise SyncError(f"{full} already exists and is public. Companion configs can hold passwords, "
+                        f"so make it private on GitHub (or choose another name) and try again.")
+    s.github_repo = repo.get("full_name", full)
+    return s.github_repo
+
+
+def github_install_link(s):
+    return f"{GITHUB_WEB}/apps/{s.github_app_slug}/installations/new" if s.github_app_slug else GITHUB_WEB
+
+
+def github_granted_repos(s):
+    """'Limited' option: the repositories this sign-in was given, i.e. those the
+    person ticked when installing the Companion Sync GitHub App."""
+    st, inst = _gh_user(s, "GET", "/user/installations")
+    if st != 200:
+        raise SyncError(f"Couldn't ask GitHub which repositories Companion Sync can use ({st}).")
+    repos = []
+    for i in inst.get("installations", []):
+        st, r = _gh_user(s, "GET", f"/user/installations/{i['id']}/repositories")
+        if st == 200:
+            repos += [x["full_name"] for x in r.get("repositories", [])]
+    if not repos:
+        raise SyncError("Companion Sync hasn't been given a repository yet.\n\n"
+                        "Make a private repository on GitHub, then open this link and tick just that one:\n"
+                        f"  {github_install_link(s)}")
+    return sorted(set(repos))
 
 
 class GitHubStorage:
