@@ -442,7 +442,22 @@ def t_move_encrypted(w):
     assert read_value(b2.base) == SECRET
 
 
-SCENARIOS = [t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def t_sign_in_elsewhere(w):
+    """Headless Pi: rclone's 'run this on a computer with a browser, paste the result' sign-in."""
+    if w.kind != "rclone":
+        return
+    a = w.rigs["alpha"]
+    shown = []
+    token = '{"access_token":"x","token_type":"bearer","expiry":"0001-01-01T00:00:00Z"}'
+    E.connect_rclone_elsewhere(a, "dropbox", lambda help: shown.append(help) or token)
+    assert 'rclone authorize "dropbox"' in shown[0], shown
+    assert (a.storage_kind, a.rclone_remote) == ("dropbox", "cs-dropbox")
+    conf = open(a.rclone_config).read()
+    assert "[cs-dropbox]" in conf and '"access_token":"x"' in conf, conf
+    expect_error(lambda: E.connect_rclone_elsewhere(a, "onedrive", lambda help: ""), "nothing was pasted")
+
+
+SCENARIOS = [t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

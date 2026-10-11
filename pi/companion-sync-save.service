@@ -1,5 +1,5 @@
 [Unit]
-Description=Save Companion config to Google Drive (only if this rig holds it)
+Description=Save the Companion config to the chosen storage (only if this rig holds it)
 After=network-online.target
 
 [Service]

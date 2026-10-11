@@ -2,6 +2,7 @@
 """Companion Sync: share one Companion config between rigs, through a storage
 of your choice (Google Drive, GitHub, Dropbox, OneDrive, a network folder or iCloud Drive).
 
+  companion-sync setup    choose where the config is stored (or move it), sign in, check
   companion-sync status   who holds the config right now
   companion-sync take     lock the config to this rig and download it
   companion-sync save     upload this rig's current config, keep the lock
@@ -10,6 +11,9 @@ of your choice (Google Drive, GitHub, Dropbox, OneDrive, a network folder or iCl
                           at start-up, before Companion runs: take the config
                           if it's free or already this rig's, never ask, never
                           wait long; the outcome is written to FILE as JSON
+  companion-sync unlock   give this rig the passphrase of an encrypted config
+  companion-sync encryption on|off
+                          encrypt the stored config (or stop), from the rig that has it
 
 Only one rig holds the config at a time. The holder saves every 15 minutes
 (SQLite live backup, so Companion keeps running). A lock not refreshed for
@@ -1187,6 +1191,55 @@ def connect_rclone(s, kind):
     use_rclone(s, kind)
 
 
+RCLONE_TYPES = {"gdrive": "drive", "dropbox": "dropbox", "onedrive": "onedrive"}
+
+
+def google_client():
+    """The Google sign-in details shipped with the build (_client.py), or ('', '')."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _client import CLIENT_ID, CLIENT_SECRET
+        return CLIENT_ID, CLIENT_SECRET
+    except ImportError:
+        return os.environ.get("CS_CLIENT_ID", ""), os.environ.get("CS_CLIENT_SECRET", "")
+
+
+def connect_rclone_elsewhere(s, kind, get_token):
+    """Sign in to Google Drive, Dropbox or OneDrive from a machine with no web
+    browser (a headless Pi). rclone gives a command to run on a computer that
+    has one; get_token(instructions) shows them and returns what was pasted back."""
+    remote, typ = RCLONE_REMOTES[kind], RCLONE_TYPES[kind]
+    opts = []
+    if kind == "gdrive":
+        cid, secret = google_client()
+        if not cid:
+            raise SyncError("This copy of Companion Sync has no Google sign-in details.")
+        opts = ["scope=drive.file", f"client_id={cid}", f"client_secret={secret}"]
+    rc(s, "config", "delete", remote, check=False)
+    r = rc(s, "config", "create", remote, typ, *opts, "config_is_local=false", "--non-interactive")
+    for _ in range(20):                                       # rclone asks one question at a time
+        try:
+            q = json.loads(r.stdout)
+        except ValueError:
+            raise SyncError(f"rclone didn't answer as expected:\n{r.stdout[-300:]}{r.stderr[-300:]}")
+        if q.get("Error"):
+            raise SyncError(f"Sign-in to {STORAGE_KINDS[kind]} failed: {q['Error']}")
+        opt = q.get("Option")
+        if not q.get("State") and not opt:
+            break
+        if opt["Name"] == "config_token":
+            answer = (get_token(opt.get("Help", "")) or "").strip()
+            if not answer:
+                raise SyncError("Nothing was pasted, so the sign-in was stopped.")
+        else:
+            answer = opt.get("DefaultStr", "")                # any other question: rclone's default
+        r = rc(s, "config", "create", remote, typ, "--continue", "--state", q["State"],
+               "--result", answer, "--non-interactive")
+    else:
+        raise SyncError("rclone kept asking questions, so the sign-in was stopped.")
+    use_rclone(s, kind)
+
+
 def connect_github(s, mode, show_code, choose_repo):
     """Sign in to GitHub with the chosen option and pick the repository.
     show_code(code, address): show the sign-in code. choose_repo(list) -> one of them."""
@@ -1715,7 +1768,8 @@ def move_storage(s, new):
     mark_holding(new, True)
     record_ok(new, "save")
     return (f"The config has moved to {new.place}, and {s.rig} still has it.\n\n"
-            f"On every other rig, choose {new.place} in Storage… (same account). The old copy "
+            f"On every other rig, choose {new.place} in Storage… (on a Pi: companion-sync setup), "
+            f"with the same account. The old copy "
             f"stays in {s.place} as a backup, marked as moved.")
 
 
@@ -1750,7 +1804,7 @@ def check_storage(s):
     where = s.store.describe()
     if not dv:
         there = ("There's no config here yet. Open Companion on the rig whose config you want "
-                 "to share, and it'll offer to put it here.")
+                 "to share, and it'll offer to put it here (on a Pi: companion-sync take).")
     elif h:
         there = f"There's a Companion {vtext(dv)} config here, held by {holder_name(h)}."
     else:
@@ -1814,6 +1868,160 @@ def _cli_confirm(msg):
     return input("(y/N) ").strip().lower() == "y"
 
 
+def _cli_ask(prompt, default=""):
+    try:
+        got = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+    except EOFError:
+        return default
+    return got or default
+
+
+def _cli_yes(prompt):
+    return _cli_ask(f"{prompt} (y/N)").lower().startswith("y")
+
+
+def _cli_pick(title, options):
+    """Numbered menu. Returns the index picked, or None."""
+    print(f"\n{title}")
+    for i, o in enumerate(options, 1):
+        print(f"  {i}. {o}")
+    got = _cli_ask("Number (Enter to cancel)")
+    return int(got) - 1 if got.isdigit() and 1 <= int(got) <= len(options) else None
+
+
+def _cli_show_code(code, url):
+    print(f"\nOn your phone or any computer, open:\n\n    {url}\n\nand enter the code:\n\n    {code}\n")
+    print("Then click Authorize. Waiting for GitHub...", flush=True)
+
+
+def _cli_get_token(instructions):
+    print("\n" + "-" * 70)
+    print(instructions.strip())
+    print("\n(rclone for Windows/Mac/Linux: https://rclone.org/downloads/ - the command opens a "
+          "browser to sign in, then prints a line starting {\"access_token\"... or {\"token\"... )")
+    print("-" * 70)
+    return _cli_ask("\nPaste the result here")
+
+
+def _cli_passphrase(s, why):
+    import getpass
+    print(why)
+    while True:
+        try:
+            p = getpass.getpass("Passphrase (Enter to stop): ")
+        except EOFError:
+            return False
+        if not p:
+            return False
+        try:
+            unlock(s, p)
+            print("Passphrase accepted. This rig will remember it.")
+            return True
+        except SyncError as e:
+            print(e)
+
+
+PI_STORAGE_OPTIONS = [
+    ("gdrive", "Google Drive"),
+    ("github-quick", "GitHub, quick: makes a private repository for you (sign in with a code: easiest without a screen)"),
+    ("github-limited", "GitHub, limited: only the one repository you pick (sign in with a code)"),
+    ("dropbox", "Dropbox"),
+    ("onedrive", "OneDrive"),
+    ("nas", "Network folder / NAS (already mounted on this Pi)"),
+]
+
+
+def cli_setup(s):
+    """Choose (or move to) the storage, sign in and check it, from a terminal."""
+    import dataclasses
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("Run setup as the user Companion Sync runs as, WITHOUT sudo:\n    companion-sync setup")
+        return 1
+    print(f"Companion Sync setup for this rig: {s.rig}\nStorage now: {s.place}")
+    moving = False
+    try:
+        if signed_in(s):
+            st = status(s)
+            moving = st["mine"]
+            if st["moved"]:
+                print(f"  The config has moved {st['moved']}")
+            elif moving:
+                print("  This rig has the config.")
+            else:
+                print(f"  Config is with {st['holder']}." if st["holder"] else "  Config is free.")
+    except SyncError as e:
+        print(f"  ({str(e).splitlines()[0]})")
+    if moving:
+        print("\nThis rig has the config, so the config will MOVE to the storage you pick "
+              "(it must be empty). Every other rig then needs to choose it too.")
+    i = _cli_pick("Where should the shared Companion config live? Every rig must use the same storage "
+                  "and account.", [label for _, label in PI_STORAGE_OPTIONS])
+    if i is None:
+        return 1
+    key = PI_STORAGE_OPTIONS[i][0]
+    n = dataclasses.replace(s)
+    if key.startswith("github"):
+        mode = key.split("-")[1]
+        if mode == "limited":
+            use_github(n, "limited")
+            print("\n1. Make a PRIVATE repository on GitHub (for example companion-sync-config).\n"
+                  "2. Open this page, choose 'Only select repositories' and tick just that one:\n"
+                  f"     {github_install_link(n)}")
+            _cli_ask("\nPress Enter when that's done")
+
+        def pick_repo(repos):
+            j = _cli_pick("Which repository should hold the config?", repos)
+            return repos[j] if j is not None else None
+        connect_github(n, mode, _cli_show_code, pick_repo)
+        print(f"Signed in. Repository: {n.github_repo}")
+    elif key == "nas":
+        print("\nThe share must already be mounted on this Pi (for example in /etc/fstab, so it's "
+              "there after a restart). A CompanionSync folder is made inside it.")
+        use_folder(n, "nas", _cli_ask("Folder path, e.g. /mnt/nas/companion"))
+    else:
+        if _cli_yes(f"\nCan you use a web browser ON this Pi right now (a screen, or Raspberry Pi Connect's screen sharing)?"):
+            if key == "gdrive":
+                cid, secret = google_client()
+                if not cid:
+                    raise SyncError("This copy of Companion Sync has no Google sign-in details.")
+                use_rclone(n, "gdrive")
+                sign_in(n, cid, secret)
+            else:
+                connect_rclone(n, key)
+        else:
+            connect_rclone_elsewhere(n, key, _cli_get_token)
+    print(f"\nChecking {n.place}...")
+    result = check_storage(n)
+    print(result)
+    if moving:
+        if not _cli_yes(f"\nMove the config from {s.place} to {n.place} now?"):
+            return 1
+        print(move_storage(s, n))
+    for k in SAVED_CHOICE:
+        setattr(s, k, getattr(n, k))
+    save_storage_choice(s)
+    print(f"\nThis rig now uses {s.place}.")
+    if moving:
+        return 0
+    marker = encryption_marker(s)
+    if marker and _saved_key(s, marker) is None:
+        _cli_passphrase(s, "\nThe config there is encrypted. Enter its passphrase so this rig can use it.")
+    if not drive_version(s):
+        try:
+            local_version(s)
+        except SyncError:
+            print("\nThere's no config there yet, and Companion hasn't been run on this Pi. Run Companion "
+                  "once (or set up the rig whose config you want to share), then: companion-sync take")
+            return 0
+        if _cli_yes(f"\nThere's no config in {s.place} yet. Put THIS Pi's Companion config there and "
+                    f"share it from now on? (Only do this on the rig whose config you want to keep.)"):
+            print(start_sharing(s))
+    else:
+        print("\nThe config is taken automatically when the Pi starts (if it's free), or now with:\n"
+              "    companion-sync take")
+    return 0
+
+
 def main(argv):
     if argv[:1] == ["_snapshot"] and len(argv) == 3:     # internal, run via sudo on the Pi
         _snapshot_local(argv[1], argv[2])
@@ -1835,8 +2043,26 @@ def main(argv):
             os.replace(report + ".tmp", report)
         return 0
     try:
+        if cmd == "setup":
+            return cli_setup(s)
+        if cmd == "unlock":
+            return 0 if _cli_passphrase(s, f"Passphrase for the encrypted config in {s.place}.") else 1
+        if cmd == "encryption" and argv[1:2] == ["on"]:
+            import getpass
+            p1 = getpass.getpass(f"Choose a passphrase (at least {ENC_MIN_PASSPHRASE} characters): ")
+            if p1 != getpass.getpass("Type it again: "):
+                print("Those didn't match.")
+                return 1
+            print(turn_on_encryption(s, p1))
+            return 0
+        if cmd == "encryption" and argv[1:2] == ["off"]:
+            if _cli_confirm(f"Store the config in {s.place} unencrypted again?"):
+                print(turn_off_encryption(s))
+            return 0
         if cmd == "status":
             st = status(s)
+            if st["moved"]:
+                print(f"The config has MOVED {st['moved']}. Run: companion-sync setup")
             if st["holder"]:
                 print(f"Config is TAKEN by: {st['holder']}  "
                       f"(last seen {st['age_hours']:.1f} hours ago)")
@@ -1847,7 +2073,17 @@ def main(argv):
             if st["stranded"]:
                 print("This rig's lock was taken over; its next save goes to 'stranded'.")
         elif cmd == "take":
-            print("\nDONE. " + take(s, _cli_confirm))
+            try:
+                print("\nDONE. " + take(s, _cli_confirm))
+            except NeedsPassphrase as e:
+                if not (sys.stdin.isatty() and _cli_passphrase(s, str(e))):
+                    raise
+                print("\nDONE. " + take(s, _cli_confirm))
+            except NoConfigYet as e:
+                if not (sys.stdin.isatty() and _cli_confirm(
+                        f"{e} Put this rig's Companion config there and share it from now on?")):
+                    raise
+                print("\nDONE. " + start_sharing(s))
         elif cmd == "save":
             msg = save(s, quiet)
             if msg and not quiet:

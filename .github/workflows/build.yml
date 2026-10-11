@@ -72,10 +72,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Google sign-in details
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python build/write_client.py
       - name: Package for the Pi
         run: |
           mkdir -p pkg/companion-sync
-          cp -r engine.py panel pi pkg/companion-sync/
+          cp -r engine.py _client.py panel pi pkg/companion-sync/
           echo "${{ github.run_number }}" > pkg/companion-sync/BUILD
           find pkg -name __pycache__ -prune -exec rm -rf {} +
           tar czf Companion-Sync-Pi.tar.gz -C pkg companion-sync

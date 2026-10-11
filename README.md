@@ -16,7 +16,14 @@ Google sign-in details come from the repository secrets `GOOGLE_CLIENT_ID` and `
 
 ## On the Pi
 
-Download `Companion-Sync-Pi.tar.gz` from the latest release, unpack it and run `sudo ./companion-sync/pi/install.sh`.
+Download `Companion-Sync-Pi.tar.gz` from the latest release, unpack it and run `sudo ./companion-sync/pi/install.sh`
+(add `--panel` for the 2.4" touchscreen panel). Then, as the same user and without sudo, run `companion-sync setup`
+to choose where the config is stored and sign in. No screen is needed: GitHub signs in with a code typed on your
+phone, a network folder just needs mounting, and Google Drive / Dropbox / OneDrive give a command to run on any
+computer with a browser, whose result is pasted back. The user needs to be able to use sudo without a password
+(the Pi's normal first user can).
+
+Other commands: `companion-sync status | take | save | return | unlock | encryption on|off`.
 After that, the panel's **UPDATE CS** button installs newer builds itself. It needs a GitHub fine-grained token
 with read-only *Contents* access to this repository, saved on the Pi in `~/.config/companion-sync/github-token`.
 
