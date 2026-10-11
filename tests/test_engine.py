@@ -61,15 +61,15 @@ class World:
         self.github = None
         if kind == "github":
             self.github = FakeGitHub()
-            extra = dict(storage="github", github_repo=self.github.repo, github_client_id="test-client",
-                         github_http=self.github)
+            extra = dict(storage="github", storage_kind="github", github_repo=self.github.repo,
+                         github_client_id="test-client", github_http=self.github)
         elif kind == "rclone":
             conf = os.path.join(self.tmp, "rclone.conf")
             with open(conf, "w") as f:
                 f.write(f"[gdrive]\ntype = alias\nremote = {shared}\n")
-            extra = dict(storage="rclone", rclone_config=conf)
+            extra = dict(storage="rclone", storage_kind="gdrive", rclone_config=conf)
         else:
-            extra = dict(storage="folder", folder_path=os.path.join(shared, "CompanionSync"))
+            extra = dict(storage="folder", storage_kind="nas", folder_path=os.path.join(shared, "CompanionSync"))
             os.makedirs(extra["folder_path"])
         self.shared = shared
         self.rigs = {}
@@ -262,7 +262,71 @@ def t_github_limited(w):
     assert E.github_granted_repos(a) == ["nige/companion-data"]
 
 
-SCENARIOS = [t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def t_first_rig_starts_sharing(w):
+    """Empty storage: take says so; the first rig puts its config there; others can then take it."""
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    make_config(a.base, value="first")
+    expect_error(lambda: E.take(a), "no config", E.NoConfigYet)
+    E.start_sharing(a)
+    assert E.status(a)["mine"]
+    expect_error(lambda: E.start_sharing(b), "already a config")
+    E.return_(a)
+    make_config(b.base, value="b")
+    E.take(b)
+    assert read_value(b.base) == "first"
+
+
+def t_check_storage(w):
+    a = w.rigs["alpha"]
+    out = E.check_storage(a)
+    assert "Reading and writing both work" in out and "no config here yet" in out, out
+    seed(w)
+    out = E.check_storage(w.rigs["bravo"])
+    assert "held by alpha" in out, out
+
+
+def t_messages_name_storage(w):
+    seed(w)
+    a = w.rigs["alpha"]
+    want = {"folder": "the network folder", "rclone": "Google Drive", "github": "GitHub"}[w.kind]
+    msg = E.save(a)
+    assert msg.startswith(f"Saved to {want}"), msg
+
+
+def t_choice_saved(w):
+    """The storage choice is saved per rig and comes back next time."""
+    if w.kind != "folder":
+        return
+    a = w.rigs["alpha"]
+    a.storage_file = os.path.join(w.tmp, "alpha-storage.json")
+    nas = os.path.join(w.tmp, "nas-share")
+    os.makedirs(nas)
+    E.use_folder(a, "nas", nas)
+    assert a.folder_path == os.path.join(nas, "CompanionSync") and os.path.isdir(a.folder_path)
+    E.save_storage_choice(a)
+    fresh = E.Settings("mac", a.base, a.safety_dir, a.holding_file, rig="alpha", storage_file=a.storage_file)
+    assert fresh.storage_kind == "gdrive"
+    E.load_storage_choice(fresh)
+    assert (fresh.storage_kind, fresh.storage, fresh.folder_path) == ("nas", "folder", a.folder_path)
+    expect_error(lambda: E.use_folder(a, "nas", os.path.join(w.tmp, "missing")), "can't find")
+
+
+def t_github_connect(w):
+    """Choosing GitHub from the Storage window: both options end up pointed at a repository."""
+    if w.kind != "github":
+        return
+    gh, a = w.github, w.rigs["alpha"]
+    a.github_client_id = ""                                   # connect_github fills these in
+    E.connect_github(a, "quick", lambda c, u: None, lambda r: None)
+    assert (a.storage_kind, a.github_mode, a.github_repo) == ("github", "quick", "nige/companion-sync-config")
+    gh.repo = "nige/companion-data"
+    gh.installed = ["nige/companion-data", "nige/other"]
+    E.connect_github(a, "limited", lambda c, u: None, lambda repos: repos[0])
+    assert (a.github_mode, a.github_repo, a.github_client_id) == ("limited", "nige/companion-data", "Iv23liZE4l3VNzqtCS2G")
+    assert "Reading and writing both work" in E.check_storage(a)
+
+
+SCENARIOS = [t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

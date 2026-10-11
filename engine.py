@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Companion Sync: share one Companion config between rigs via Google Drive.
+"""Companion Sync: share one Companion config between rigs, through a storage
+of your choice (Google Drive, GitHub, Dropbox, OneDrive, a network folder or iCloud Drive).
 
   companion-sync status   who holds the config right now
   companion-sync take     lock the config to this rig and download it
@@ -15,7 +16,7 @@ Only one rig holds the config at a time. The holder saves every 15 minutes
 24 hours can be taken over, after asking. Take replaces the config, so on a
 desktop rig Companion must be quit first.
 
-Companion keeps one config folder per version (v5.0, v5.1 ...). Drive records
+Companion keeps one config folder per version (v5.0, v5.1 ...). The storage records
 which version its copy is; a rig with an older Companion refuses a newer
 config, and a rig with a newer Companion lets Companion upgrade the old one.
 
@@ -58,6 +59,10 @@ class Offline(SyncError):
     pass
 
 
+class NoConfigYet(SyncError):
+    """The storage has no config yet: this rig can start sharing its own (start_sharing)."""
+
+
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
@@ -80,12 +85,14 @@ class Settings:
     safety_dir: str                    # safety copies, OUTSIDE base
     holding_file: str                  # local note: this rig took the config
     rig: str = field(default_factory=lambda: socket.gethostname().split(".")[0].lower())
-    folder: str = "CompanionSync"      # folder on Google Drive
+    folder: str = "CompanionSync"      # folder in the storage (Google Drive, Dropbox, OneDrive, GitHub)
     rclone: str = "rclone"
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
     state_file: str = ""               # last save / last problem, for the Pi panel
-    storage: str = "rclone"            # 'rclone' (Google Drive etc.), 'folder' or 'github'
+    storage_kind: str = "gdrive"       # which storage was chosen: see STORAGE_KINDS
+    storage_file: str = ""             # where the choice is saved
+    storage: str = "rclone"            # how it's reached: 'rclone' (Google Drive, Dropbox, OneDrive), 'folder' or 'github'
     rclone_remote: str = REMOTE_NAME   # which rclone remote, when storage is 'rclone'
     folder_path: str = ""              # the shared folder, when storage is 'folder'
     github_repo: str = ""              # 'owner/name', when storage is 'github'
@@ -100,6 +107,11 @@ class Settings:
     keep_history: int = 30
     stale_hours: float = 24
     log: object = print
+
+    @property
+    def place(self):
+        """The storage's name, for messages: 'Google Drive', 'GitHub'..."""
+        return STORAGE_KINDS.get(self.storage_kind, self.storage_kind)
 
     @property
     def remote(self):
@@ -177,8 +189,11 @@ def default_settings(**kw):
                      os.path.join(home, ".companion-sync-holding"))
     s.rig = stable_rig_name(os.path.join(home, ".companion-sync-rig-name"))
     s.state_file = os.path.join(home, ".companion-sync-state.json")
+    s.storage_file = os.path.join(home, ".companion-sync-storage.json")
+    s.github_token_file = os.path.join(home, ".companion-sync-github.json")
     for k, v in kw.items():
         setattr(s, k, v)
+    load_storage_choice(s)
     return s
 
 
@@ -251,7 +266,7 @@ class RcloneStorage:
         return f"{self.s.remote}/{rel}" if rel else self.s.remote
 
     def describe(self):
-        return f"{self.s.rclone_remote}:{self.s.folder}"
+        return f"{self.s.folder} folder"
 
     def signed_in(self):
         r = rc(self.s, "listremotes", check=False)
@@ -259,7 +274,7 @@ class RcloneStorage:
 
     def read(self, rel):
         r = rc(self.s, "cat", self._p(rel), check=False)
-        _raise_if_offline(r)
+        _raise_if_offline(r, self.s.place)
         return r.stdout if r.returncode == 0 else None
 
     def write(self, rel, text):
@@ -281,7 +296,7 @@ class RcloneStorage:
     def dirs(self, rel, strict=False):
         r = rc(self.s, "lsf", "--dirs-only", self._p(rel), check=False)
         if strict:
-            _raise_if_offline(r)
+            _raise_if_offline(r, self.s.place)
         return [d.rstrip("/") for d in r.stdout.split()] if r.returncode == 0 else []
 
     def exists(self, rel):
@@ -840,6 +855,94 @@ def sign_in(s, client_id, client_secret):
        "client_id", client_id, "client_secret", client_secret)
 
 
+# ---- choosing the storage --------------------------------------------------
+# Each rig keeps its own choice in s.storage_file. Every rig sharing a config
+# must choose the same storage (and the same account / repository / folder).
+
+STORAGE_KINDS = {                     # kind: name shown to people
+    "gdrive": "Google Drive",
+    "github": "GitHub",
+    "dropbox": "Dropbox",
+    "onedrive": "OneDrive",
+    "nas": "the network folder",
+    "icloud": "iCloud Drive",
+}
+RCLONE_REMOTES = {"gdrive": REMOTE_NAME, "dropbox": "cs-dropbox", "onedrive": "cs-onedrive"}
+SAVED_CHOICE = ("storage_kind", "storage", "rclone_remote", "folder_path", "github_repo",
+                "github_branch", "github_mode", "github_client_id", "github_app_slug")
+
+
+def load_storage_choice(s):
+    """Apply the saved choice, if there is one (otherwise Google Drive, as before)."""
+    try:
+        with open(s.storage_file) as f:
+            saved = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return
+    for k in SAVED_CHOICE:
+        if k in saved:
+            setattr(s, k, saved[k])
+
+
+def save_storage_choice(s):
+    tmp = s.storage_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: getattr(s, k) for k in SAVED_CHOICE}, f, indent=1)
+    os.replace(tmp, s.storage_file)
+
+
+def use_rclone(s, kind):
+    s.storage_kind, s.storage, s.rclone_remote = kind, "rclone", RCLONE_REMOTES[kind]
+
+
+def use_folder(s, kind, path):
+    """kind 'nas' or 'icloud'. `path` is the folder chosen (or the iCloud Drive
+    folder); the config goes in a CompanionSync folder inside it."""
+    if not path or not os.path.isdir(path):
+        raise SyncError(f"Can't find the folder:\n  {path or '(none chosen)'}")
+    target = path if os.path.basename(path.rstrip("/\\")) == s.folder else os.path.join(path, s.folder)
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        raise SyncError(f"Can't make the {s.folder} folder there:\n  {target}\n{e}")
+    s.storage_kind, s.storage, s.folder_path = kind, "folder", target
+
+
+def icloud_folder():
+    """This computer's iCloud Drive folder, or None if iCloud Drive isn't set up."""
+    home = os.path.expanduser("~")
+    if MAC:
+        p = os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs")
+    elif WIN:
+        p = os.path.join(home, "iCloudDrive")
+    else:
+        return None
+    return p if os.path.isdir(p) else None
+
+
+def connect_rclone(s, kind):
+    """Dropbox or OneDrive: rclone opens the browser to sign in."""
+    remote = RCLONE_REMOTES[kind]
+    rc(s, "config", "delete", remote, check=False)          # start clean if signing in again
+    rc(s, "config", "create", remote, kind)
+    use_rclone(s, kind)
+
+
+def connect_github(s, mode, show_code, choose_repo):
+    """Sign in to GitHub with the chosen option and pick the repository.
+    show_code(code, address): show the sign-in code. choose_repo(list) -> one of them."""
+    use_github(s, mode)
+    s.storage_kind = "github"
+    github_sign_in(s, show_code)
+    if mode == "quick":
+        github_quick_setup(s)
+    else:
+        repos = github_granted_repos(s)
+        s.github_repo = repos[0] if len(repos) == 1 else choose_repo(repos)
+        if not s.github_repo:
+            raise SyncError("No repository chosen.")
+
+
 def _sudo(s, cmd):
     return ["sudo"] + cmd if s.platform == "pi" else cmd
 
@@ -1002,20 +1105,20 @@ def install_config(s, version, src):
 
 
 # ---- lock ------------------------------------------------------------------
-# The LOCK file on Drive says which rig holds the config. The holder refreshes
+# The LOCK file in the storage says which rig holds the config. The holder refreshes
 # it on every save, so its age = time since the holder was last seen online.
 # The holding file is a local note that this rig took the config, so a rig
 # whose lock was taken over knows its unsaved edits are stranded.
 
-def _raise_if_offline(r):
+def _raise_if_offline(r, place="Google Drive"):
     """rclone failed: a missing file is fine, anything else is a problem."""
     if r.returncode == 0:
         return
     err = r.stderr.lower()
     if "didn't find section" in err or "not configured" in err:
-        raise Offline("Not signed in to Google Drive yet.")
+        raise Offline(f"Not signed in to {place} yet.")
     if not ("object not found" in err or "directory not found" in err or "doesn't exist" in err):
-        raise Offline("Can't reach Google Drive. Are you online?\n" + r.stderr.strip()[-300:])
+        raise Offline(f"Can't reach {place}. Are you online?\n" + r.stderr.strip()[-300:])
 
 
 def lock_holder(s):
@@ -1082,9 +1185,9 @@ def upload(s, version, dest=None):
 # so the config alone doesn't carry them. Store modules get re-downloaded by
 # Companion when it's online, but custom ones (imported packages) don't exist
 # anywhere else. Each version folder never changes once installed, so on save
-# any folder Drive doesn't have yet is uploaded to modules/ on Drive, and on
-# take any folder this rig doesn't have is copied in before Companion starts.
-# modules/modules.json lists what's on Drive. Nothing is ever deleted.
+# any folder the storage doesn't have yet is uploaded to its modules/ folder, and
+# on take any folder this rig doesn't have is copied in before Companion starts.
+# modules/modules.json lists what's in the storage. Nothing is ever deleted.
 
 MODULE_KINDS = {"modules": "connection", "surfaces": "surface"}
 MODULE_FOLDER_RE = re.compile(r"^(.+)-(\d+\.\d+\.\d+.*)$")     # 'allenheath-sq-3.1.1-grid.6'
@@ -1109,7 +1212,7 @@ def _copy_folder(s, src, dst):
 
 
 def upload_modules(s):
-    """Upload installed module versions Drive doesn't have yet. Returns their names."""
+    """Upload installed module versions the storage doesn't have yet. Returns their names."""
     added = []
     with tempfile.TemporaryDirectory() as tmp:
         for sub in MODULE_KINDS:
@@ -1149,7 +1252,7 @@ def download_modules(s):
                 dl = os.path.join(tmp, sub, name)
                 s.store.copy_down(f"modules/{sub}/{name}", dl)
                 if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
-                    s.log(f"Skipped module {name}: incomplete on Google Drive")
+                    s.log(f"Skipped module {name}: incomplete in {s.place}")
                     continue
                 dst = os.path.join(s.base, sub, name)
                 _copy_folder(s, dl, dst)
@@ -1174,13 +1277,13 @@ def _modules_step(s, fn, verb):
 def _save_stranded(s, holder):
     upload(s, local_version(s), f"stranded/{s.rig}")
     return (f"NOT saved to the main copy: the config was taken over by {holder_name(holder) or 'nobody'}.\n"
-            f"This rig's version is safe on Google Drive in {s.folder}/stranded/{s.rig}.")
+            f"This rig's version is safe in {s.place}, in stranded/{s.rig}.")
 
 
 # ---- commands --------------------------------------------------------------
 
 def status(s):
-    """Plain facts for display. Raises Offline if Drive can't be reached."""
+    """Plain facts for display. Raises Offline if the storage can't be reached."""
     tidy_safety_copies(s)
     h = lock_holder(s)
     return {
@@ -1193,7 +1296,7 @@ def status(s):
 
 
 def take(s, confirm_takeover=None, manage_companion=True):
-    """Lock the config to this rig and install Drive's copy.
+    """Lock the config to this rig and install the stored copy.
 
     confirm_takeover(message) -> bool is asked before taking over a stale
     lock; without it, a stale lock is never taken over (e.g. at boot).
@@ -1212,24 +1315,24 @@ def take(s, confirm_takeover=None, manage_companion=True):
                             f"(last seen {age:.1f} hours ago). Return it on that rig first.")
         msg = (f"The config is held by {holder_name(h)}, but that rig hasn't been seen for "
                f"{age:.0f} hours.\n\nIf you take it, any changes that rig hasn't saved stay on it "
-               f"(they go to 'stranded' on Google Drive when it next comes online).\n\nTake it anyway?")
+               f"(they go to 'stranded' in {s.place} when it next comes online).\n\nTake it anyway?")
         if not (confirm_takeover and confirm_takeover(msg)):
             raise SyncError("Not taken.")
     dv = drive_version(s)
     if not dv:
-        raise SyncError("There's no config on Google Drive yet.")
+        raise NoConfigYet(f"There's no config in {s.place} yet.")
     if vkey(dv) > vkey(lv):
-        raise NeedsUpdate(f"The config on Google Drive is from Companion {vtext(dv)}, but this rig "
+        raise NeedsUpdate(f"The config in {s.place} is from Companion {vtext(dv)}, but this rig "
                         f"has Companion {vtext(lv)}.\nUpdate Companion on this rig first.")
     if manage_companion:
         stop_companion(s)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dl = os.path.join(tmp, dv)
-            s.log("Downloading config from Google Drive...")
+            s.log(f"Downloading config from {s.place}...")
             s.store.pull_tree(dv, dl)
             if not os.path.exists(os.path.join(dl, "db.sqlite")):
-                raise SyncError("The config on Google Drive looks incomplete (no db.sqlite).")
+                raise SyncError(f"The config in {s.place} looks incomplete (no db.sqlite).")
             install_config(s, dv, dl)
             if vkey(dv) < vkey(lv):
                 # This rig has a newer Companion. Move its own newer folder aside so
@@ -1251,7 +1354,7 @@ def save(s, quiet=False):
     """Upload the current config and keep the lock.
 
     quiet=True is for the 15-minute timer: returns None without error if this
-    rig doesn't hold the config or Drive can't be reached.
+    rig doesn't hold the config or the storage can't be reached.
     """
     try:
         h = lock_holder(s)
@@ -1269,14 +1372,14 @@ def save(s, quiet=False):
     dv = drive_version(s)
     if dv and vkey(lv) < vkey(dv):
         raise NeedsUpdate(f"This rig's Companion ({vtext(lv)}) is older than the config on "
-                        f"Google Drive ({vtext(dv)}). Not saved.")
+                        f"{s.place} ({vtext(dv)}). Not saved.")
     upload(s, lv)
     _modules_step(s, upload_modules, "uploaded")
     write_lock(s, taken_time(h))
     mark_holding(s, True)
     record_ok(s, "save")
     note = f" (config upgraded to Companion {vtext(lv)})" if dv and lv != dv else ""
-    return f"Saved to Google Drive{note}. {s.rig} still has the config."
+    return f"Saved to {s.place}{note}. {s.rig} still has the config."
 
 
 def return_(s):
@@ -1287,7 +1390,7 @@ def return_(s):
             mark_holding(s, False)
             return msg
         raise SyncError("This rig doesn't have the config, so there's nothing to return.")
-    s.log("Uploading config to Google Drive...")
+    s.log(f"Uploading config to {s.place}...")
     lv = local_version(s)
     upload(s, lv)
     _modules_step(s, upload_modules, "uploaded")
@@ -1295,6 +1398,43 @@ def return_(s):
     mark_holding(s, False)
     record_ok(s, "return")
     return f"Config returned and unlocked. Changes made on {s.rig} from now on won't be kept."
+
+
+def start_sharing(s):
+    """First rig: put this rig's config into empty storage and hold it."""
+    if drive_version(s):
+        raise SyncError(f"There's already a config in {s.place}. Use Open Companion / take instead.")
+    if lock_holder(s):
+        raise SyncError(f"{s.place} is locked by {holder_name(lock_holder(s))}.")
+    lv = local_version(s)
+    write_lock(s, now())
+    mark_holding(s, True)
+    upload(s, lv)
+    _modules_step(s, upload_modules, "uploaded")
+    record_ok(s, "save")
+    return f"{s.rig}'s config is now in {s.place}, and {s.rig} has it."
+
+
+def check_storage(s):
+    """Connection check: can this rig read and write the storage? Returns what's
+    there, in plain words. Raises SyncError / Offline when it can't."""
+    if not signed_in(s):
+        raise Offline(f"Not signed in to {s.place}.")
+    h = lock_holder(s)                                       # reading works
+    dv = drive_version(s)
+    stamp = f"{s.rig} checked {now()}\n"
+    s.store.write(f"checks/{s.rig}", stamp)                  # writing works
+    if (s.store.read(f"checks/{s.rig}") or "").strip() != stamp.strip():
+        raise SyncError(f"Wrote a test file to {s.place} but couldn't read it back.")
+    where = s.store.describe()
+    if not dv:
+        there = ("There's no config here yet. Open Companion on the rig whose config you want "
+                 "to share, and it'll offer to put it here.")
+    elif h:
+        there = f"There's a Companion {vtext(dv)} config here, held by {holder_name(h)}."
+    else:
+        there = f"There's a Companion {vtext(dv)} config here, free to take."
+    return f"Connected to {s.place} ({where}). Reading and writing both work.\n\n{there}"
 
 
 def boot(s, net_wait=20):
@@ -1311,7 +1451,7 @@ def boot(s, net_wait=20):
         time.sleep(1)
     try:
         if not signed_in(s):
-            out.update(result="not_signed_in", message="Not signed in to Google Drive.")
+            out.update(result="not_signed_in", message=f"Not signed in to {s.place}.")
             return out
         h = lock_holder(s)
         out["holder"] = holder_name(h)
@@ -1377,7 +1517,7 @@ def main(argv):
                       f"(last seen {st['age_hours']:.1f} hours ago)")
             else:
                 print("Config is free.")
-            print(f"Google Drive has Companion {vtext(st['drive_version'])} config; "
+            print(f"{s.place} has Companion {vtext(st['drive_version'])} config; "
                   f"this rig has {vtext(local_version(s))}.")
             if st["stranded"]:
                 print("This rig's lock was taken over; its next save goes to 'stranded'.")

@@ -2,7 +2,8 @@
 
 Sits in the tray, shows who has the Companion config, and does the sync:
   - Open Companion: takes the config (if it can), then launches Companion
-  - saves to Google Drive every 15 minutes while this rig has the config
+  - saves to the chosen storage (Google Drive by default; see Storage…) every
+    15 minutes while this rig has the config
   - returns the config automatically when Companion is quit
 All the real work is in engine.py, shared with the Pi.
 """
@@ -25,7 +26,7 @@ from icon import draw_cs
 APP = "Companion Sync"
 SAVE_EVERY = 15 * 60        # seconds
 CHECK_EVERY = 30            # seconds between Companion / status checks
-STATUS_EVERY = 5 * 60       # seconds between lock checks on Drive when idle
+STATUS_EVERY = 5 * 60       # seconds between lock checks on the storage when idle
 SINGLE_INSTANCE_PORT = 47823
 
 try:                          # written by the build from GitHub secrets
@@ -106,6 +107,84 @@ def tell(msg, title=APP, problem=False):
                         f'display dialog {_osa(msg)} with title {_osa(title)} buttons {{"OK"}} '
                         f'default button "OK"' + (" with icon stop" if problem else "")],
                        capture_output=True)
+
+
+def choose(prompt, options, title=APP):
+    """Pick one of `options` (strings). Returns it, or None if cancelled."""
+    if not options:
+        return None
+    if E.MAC:
+        items = "{" + ", ".join(_osa(o) for o in options) + "}"
+        r = subprocess.run(["osascript", "-e",
+                            f"choose from list {items} with title {_osa(title)} "
+                            f"with prompt {_osa(prompt)} default items {{{_osa(options[0])}}}"],
+                           capture_output=True, text=True)
+        out = r.stdout.strip()
+        return out if out in options else None
+    import tkinter as tk                          # Windows: a small window of its own
+    picked = []
+    root = tk.Tk()
+    root.title(title)
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    tk.Label(root, text=prompt, justify="left", wraplength=460).pack(padx=16, pady=(14, 8), anchor="w")
+    lb = tk.Listbox(root, height=len(options), width=60, activestyle="none", exportselection=False)
+    for o in options:
+        lb.insert("end", o)
+    lb.selection_set(0)
+    lb.pack(padx=16)
+
+    def ok(*_):
+        sel = lb.curselection()
+        if sel:
+            picked.append(options[sel[0]])
+        root.destroy()
+    lb.bind("<Double-Button-1>", ok)
+    root.bind("<Return>", ok)
+    root.bind("<Escape>", lambda *_: root.destroy())
+    row = tk.Frame(root)
+    row.pack(pady=12, padx=16, anchor="e")
+    tk.Button(row, text="Cancel", width=10, command=root.destroy).pack(side="right", padx=(6, 0))
+    tk.Button(row, text="OK", width=10, command=ok, default="active").pack(side="right")
+    root.lift()
+    root.focus_force()
+    root.mainloop()
+    return picked[0] if picked else None
+
+
+def pick_folder(prompt, title=APP):
+    """Choose a folder. Returns its path, or None if cancelled."""
+    if E.MAC:
+        r = subprocess.run(["osascript", "-e", f"POSIX path of (choose folder with prompt {_osa(prompt)})"],
+                           capture_output=True, text=True)
+        return r.stdout.strip().rstrip("/") or None
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    p = filedialog.askdirectory(title=prompt, mustexist=True, parent=root)
+    root.destroy()
+    return os.path.normpath(p) if p else None
+
+
+def copy_text(text):
+    try:
+        subprocess.run(["clip"] if E.WIN else ["pbcopy"], input=text, text=True,
+                       creationflags=E.NO_WINDOW, check=False)
+    except OSError:
+        pass
+
+
+def show_github_code(code, url):
+    """GitHub's code sign-in: copy the code, open the page, and say what to do.
+    The message is shown on its own thread so the sign-in keeps waiting meanwhile."""
+    copy_text(code)
+    webbrowser.open(url)
+    threading.Thread(target=tell, daemon=True, args=(
+        f"Your browser has opened GitHub's sign-in page:\n  {url}\n\n"
+        f"Enter this code (it's already copied, so you can paste it):\n\n      {code}\n\n"
+        f"Then click Authorize. Companion Sync carries on by itself once you have.",)).start()
 
 
 # ---- start at login ------------------------------------------------------------
@@ -206,8 +285,9 @@ class App:
             M("Return config", self.bg(self.return_now), enabled=lambda i: self.mine),
             M("Status…", self.bg(self.show_status)),
             pystray.Menu.SEPARATOR,
-            M("Sign in to Google Drive…", self.bg(self.sign_in),
+            M(lambda i: f"Sign in to {self.s.place}…", self.bg(self.sign_in),
               visible=lambda i: not E.signed_in(self.s)),
+            M(lambda i: f"Storage: {self.s.place.removeprefix('the ').capitalize()}…", self.bg(self.choose_storage)),
             M("Start at login", lambda: set_login(not login_enabled()),
               checked=lambda i: login_enabled()),
             M("Open log", lambda: self.open_path(LOG_FILE)),
@@ -300,6 +380,14 @@ class App:
             self.notify(msg)
         except E.NeedsUpdate as e:
             self.offer_download(str(e))
+        except E.NoConfigYet as e:
+            if ask(f"{e}\n\nPut this rig's Companion config there and share it from now on?\n"
+                   f"(Do this on the rig whose config you want to keep.)"):
+                self.notify(E.start_sharing(self.s))
+                self.mine = True
+                self.last_save = datetime.datetime.now()
+            if ask("Open Companion now?"):
+                E.start_companion(self.s)
         except E.SyncError as e:
             if ask(f"{e}\n\nOpen Companion anyway, with this rig's own copy?\n"
                    f"(Changes won't be kept.)"):
@@ -327,7 +415,7 @@ class App:
         extra = "\n\nThis rig's lock was taken over; its edits will go to 'stranded'." if st["stranded"] else ""
         saved = f"\nLast saved: {self.last_save:%H:%M}" if self.last_save else ""
         text = (f"{who}{saved}\n\nThis rig: {self.s.rig}, Companion {E.vtext(lv)}\n"
-                f"Google Drive copy: Companion {E.vtext(st['drive_version'])}{extra}")
+                f"{self.s.place} copy: Companion {E.vtext(st['drive_version'])}{extra}")
         dv = st["drive_version"]
         if dv and E.vkey(dv) > E.vkey(lv):
             self.offer_download(text + f"\n\nThis rig needs Companion {E.vtext(dv)} to use the config.")
@@ -346,12 +434,100 @@ class App:
             webbrowser.open(E.COMPANION_DOWNLOAD)
 
     def sign_in(self):
-        if not CLIENT_ID:
-            raise E.SyncError("This build has no Google sign-in details.")
-        tell("Your browser will open to sign in to Google.\n\n"
-             "Sign in with the account the configs are stored in, then click Allow.")
-        E.sign_in(self.s, CLIENT_ID, CLIENT_SECRET)
-        self.notify("Signed in to Google Drive.")
+        """Sign in again to the storage already chosen."""
+        k = self.s.storage_kind
+        if k == "gdrive":
+            if not CLIENT_ID:
+                raise E.SyncError("This build has no Google sign-in details.")
+            tell("Your browser will open to sign in to Google.\n\n"
+                 "Sign in with the account the configs are stored in, then click Allow.")
+            E.sign_in(self.s, CLIENT_ID, CLIENT_SECRET)
+        elif k in ("dropbox", "onedrive"):
+            tell(f"Your browser will open to sign in to {self.s.place}.\n\n"
+                 f"Sign in with the account the configs are stored in, then allow access.")
+            E.connect_rclone(self.s, k)
+        elif k == "github":
+            E.github_sign_in(self.s, show_github_code)
+        else:
+            raise E.SyncError(f"Can't reach {self.s.place}:\n  {self.s.folder_path}\n\n"
+                              f"Check it's connected, or choose it again from Storage….")
+        self.notify(f"Signed in to {self.s.place}.")
+
+    STORAGE_OPTIONS = [
+        ("gdrive", "Google Drive"),
+        ("github-quick", "GitHub: quick (makes a private repository for you)"),
+        ("github-limited", "GitHub: limited (only the one repository you pick)"),
+        ("dropbox", "Dropbox"),
+        ("onedrive", "OneDrive"),
+        ("nas", "Network folder / NAS"),
+        ("icloud", "iCloud Drive"),
+    ]
+
+    def choose_storage(self):
+        """Choose where the shared config lives, sign in, and check the connection.
+        Every rig sharing a config must choose the same storage and account."""
+        if self.mine or E.was_holding(self.s):
+            tell(f"This rig has the config, so the storage can't be changed right now.\n\n"
+                 f"Choose Return config first, then come back to Storage….")
+            return
+        labels = [label for _, label in self.STORAGE_OPTIONS]
+        picked = choose(f"Where should the shared Companion config live?\n\n"
+                        f"Now: {self.s.place}. Every rig must use the same storage and account.", labels)
+        if not picked:
+            return
+        key = dict((label, k) for k, label in self.STORAGE_OPTIONS)[picked]
+        s = E.default_settings(log=log.info)          # try it out on a copy; keep the old choice if it fails
+        s.rclone = self.s.rclone
+        if key == "gdrive":
+            if not CLIENT_ID:
+                raise E.SyncError("This build has no Google sign-in details.")
+            E.use_rclone(s, "gdrive")
+            if not E.signed_in(s):
+                tell("Your browser will open to sign in to Google.\n\n"
+                     "Sign in with the account the configs are stored in, then click Allow.")
+                E.sign_in(s, CLIENT_ID, CLIENT_SECRET)
+        elif key.startswith("github"):
+            mode = key.split("-")[1]
+            if mode == "limited" and not ask(
+                    "GitHub, limited: Companion Sync only gets the one repository you pick.\n\n"
+                    "1. Make a PRIVATE repository on GitHub (for example companion-sync-config).\n"
+                    "2. Install Companion Sync on it: your browser will open the page. Choose "
+                    "'Only select repositories' and tick just that one.\n"
+                    "3. Then sign in with the code shown next.\n\nCarry on?"):
+                return
+            if mode == "limited":
+                E.use_github(s, "limited")
+                webbrowser.open(E.github_install_link(s))
+                if not ask("Have you installed Companion Sync on your private repository?"):
+                    return
+            E.connect_github(s, mode, show_github_code,
+                             lambda repos: choose("Which repository should hold the config?", repos))
+        elif key in ("dropbox", "onedrive"):
+            tell(f"Your browser will open to sign in to {E.STORAGE_KINDS[key]}.\n\n"
+                 f"Sign in with the account the configs are stored in, then allow access.")
+            E.connect_rclone(s, key)
+        elif key == "nas":
+            path = pick_folder("Choose the shared folder on your network drive or NAS. "
+                               "A CompanionSync folder is made inside it.")
+            if not path:
+                return
+            E.use_folder(s, "nas", path)
+        elif key == "icloud":
+            root = E.icloud_folder()
+            if not root:
+                raise E.SyncError("Can't find iCloud Drive on this computer.\n\n"
+                                  + ("Turn on iCloud Drive in System Settings > Apple Account > iCloud."
+                                     if E.MAC else "Install iCloud for Windows and turn on iCloud Drive."))
+            E.use_folder(s, "icloud", root)
+        self.set_state("busy", f"Checking {s.place}…")
+        result = E.check_storage(s)
+        for k in E.SAVED_CHOICE:                      # it works: switch over and remember it
+            setattr(self.s, k, getattr(s, k))
+        E.save_storage_choice(self.s)
+        note = ("\n\niCloud Drive can take a minute or two to pass changes between computers, "
+                "so wait a moment after returning the config on one rig before opening it on another."
+                if key == "icloud" else "")
+        tell(f"{result}\n\nThis rig now uses {self.s.place}.{note}")
 
     def open_path(self, p):
         if E.WIN:
@@ -414,7 +590,7 @@ class App:
             icon.visible = True
             self.refresh(force=True)
             if not E.signed_in(self.s):
-                self.notify("Not signed in to Google Drive. Choose 'Sign in' from the menu.")
+                self.notify(f"Not signed in to {self.s.place}. Choose 'Sign in' from the menu.")
             threading.Thread(target=self.loop, daemon=True).start()
         self.icon.run(setup=setup)
 
