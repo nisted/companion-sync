@@ -547,6 +547,9 @@ def _gh_user(s, method, path, body=None):
 
 
 GITHUB_DEFAULT_REPO = "companion-sync-config"
+GITHUB_README = ("# Companion Sync config\n\n"
+                 "Bitfocus Companion settings kept in sync by Companion Sync.\n"
+                 "Keep this repository private.\n")
 
 # The two registered GitHub apps (Client IDs are public; no secrets are used)
 GITHUB_APPS = {
@@ -680,7 +683,17 @@ class GitHubStorage:
         import base64
         for attempt in range(4):
             head, base_tree = self._head()
-            existing = self._tree() if head else {}
+            if not head:
+                # GitHub won't take files the fast way into an empty repository, so start it
+                # off with a README through the simple file API, then save as normal.
+                self._api("PUT", "/contents/README.md",
+                          {"message": "Start Companion Sync storage",
+                           "content": base64.b64encode(GITHUB_README.encode("utf-8")).decode(),
+                           "branch": self.s.github_branch}, ok=(200, 201, 422))
+                head, base_tree = self._head()
+                if not head:
+                    raise SyncError(f"Couldn't start the GitHub repository {self.s.github_repo}.")
+            existing = self._tree()
             entries = []
             for path, data in sorted(changes.items()):
                 if data is None:
@@ -690,8 +703,10 @@ class GitHubStorage:
                 sha = _git_blob_sha(data)
                 if existing.get(path) == sha:
                     continue
-                _, b = self._api("POST", "/git/blobs",
-                                 {"content": base64.b64encode(data).decode(), "encoding": "base64"})
+                st, b = self._api("POST", "/git/blobs",
+                                  {"content": base64.b64encode(data).decode(), "encoding": "base64"})
+                if st != 201:
+                    raise SyncError(f"GitHub wouldn't take the file {path} ({st}): {(b or {}).get('message', '')}")
                 entries.append({"path": path, "mode": "100644", "type": "blob", "sha": b["sha"]})
             if not entries:
                 return

@@ -83,7 +83,22 @@ class FakeGitHub:
         m = re.match(r"^/git/blobs/(\w+)$", path)
         if method == "GET" and m:
             return 200, {"content": base64.b64encode(self.blobs[m.group(1)]).decode(), "encoding": "base64"}
+        m = re.match(r"^/contents/(.+)$", path)
+        if method == "PUT" and m:                             # the simple file API works on an empty repo
+            data = base64.b64decode(body["content"])
+            sha = blob_sha(data)
+            self.blobs[sha] = data
+            files = self.tree_files(self.commits[self.head]["tree"]) if self.head else {}
+            files[m.group(1)] = sha
+            c = hashlib.sha1(f"commit{next(self.ids)}".encode()).hexdigest()
+            self.commits[c] = {"tree": self.new_tree(files), "parent": self.head, "changed": {m.group(1)},
+                               "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                               "message": body["message"]}
+            self.head = c
+            return 201, {"commit": {"sha": c}}
         if method == "POST" and path == "/git/blobs":
+            if not self.head:                                 # like GitHub: the git data API refuses empty repos
+                return 409, {"message": "Git Repository is empty."}
             data = base64.b64decode(body["content"])
             sha = blob_sha(data)
             self.blobs[sha] = data
