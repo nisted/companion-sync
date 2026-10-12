@@ -48,7 +48,7 @@ MAC = sys.platform == "darwin"
 NO_WINDOW = 0x08000000 if WIN else 0   # stop console windows flashing up from the app
 
 
-COMPANION_DOWNLOAD = "https://bitfocus.io/companion"
+COMPANION_DOWNLOAD = "https://user.bitfocus.io/download"
 
 
 class SyncError(Exception):
