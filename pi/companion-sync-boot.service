@@ -1,7 +1,7 @@
 [Unit]
 Description=Companion Sync: take the config before Companion starts (gives up quickly, never blocks it)
 After=network.target
-Before=companion.service
+Before=companion.service docker.service
 
 [Service]
 Type=oneshot

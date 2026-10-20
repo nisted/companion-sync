@@ -1,16 +1,23 @@
-"""Companion Sync: system-tray (Windows) / menu-bar (Mac) app.
+"""Companion Sync: system-tray (Windows, Raspberry Pi desktop) / menu-bar (Mac) app.
 
 Sits in the tray, shows who has the Companion config, and does the sync:
   - Open Companion: takes the config (if it can), then launches Companion
   - saves to the chosen storage (Google Drive by default; see Storage…) every
     15 minutes while this rig has the config
   - returns the config automatically when Companion is quit
-All the real work is in engine.py, shared with the Pi.
+All the real work is in engine.py, shared with the headless Pi command.
+
+On the Pi it runs from /opt/companion-sync (installed by pi/install.sh) and
+copes with Companion as the desktop app, CompanionPi's service or a Docker
+container. With a service or container, Open Companion opens its admin page,
+and the config isn't returned when Companion stops (the service is restarted
+by updates and takes); return it from the menu instead.
 """
 import dataclasses
 import datetime
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +36,7 @@ SAVE_EVERY = 15 * 60        # seconds
 CHECK_EVERY = 30            # seconds between Companion / status checks
 STATUS_EVERY = 5 * 60       # seconds between lock checks on the storage when idle
 SINGLE_INSTANCE_PORT = 47823
+LOGGED_IN_START = "--login" in sys.argv   # started at login (autostart), not opened by hand
 
 try:                          # written by the build from GitHub secrets
     from _client import CLIENT_ID, CLIENT_SECRET, BUILD
@@ -37,8 +45,11 @@ except ImportError:
     CLIENT_SECRET = os.environ.get("CS_CLIENT_SECRET", "")
     BUILD = "dev"
 
+LINUX = not E.WIN and not E.MAC
 RELEASES = "https://github.com/nisted/companion-sync/releases/latest"
-UPDATE_URL = RELEASES + ("/download/Companion-Sync-Windows.exe" if E.WIN else "/download/Companion-Sync-Mac.zip")
+UPDATE_URL = RELEASES + ("/download/Companion-Sync-Windows.exe" if E.WIN else
+                         "/download/Companion-Sync-Mac.zip" if E.MAC else
+                         "/download/Companion-Sync-Pi.tar.gz")
 
 
 # Windows: a left-click on the tray icon opens the menu, like a right-click,
@@ -61,6 +72,8 @@ if E.WIN:
 def data_dir():
     if E.WIN:
         d = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
+    elif LINUX:
+        d = os.path.expanduser("~/.config/companion-sync")
     else:
         d = os.path.expanduser(f"~/Library/Application Support/{APP}")
     os.makedirs(d, exist_ok=True)
@@ -81,12 +94,23 @@ log = logging.getLogger(APP)
 
 
 # ---- native dialogs (safe from any thread, unlike tkinter on the Mac) ------------
+# Linux (the Pi desktop) uses zenity, installed by pi/install.sh.
+
+def _zenity(*args):
+    try:
+        return subprocess.run(["zenity", f"--title={APP}", *args], capture_output=True, text=True)
+    except OSError:
+        log.info("zenity is missing: sudo apt install zenity")
+        return subprocess.CompletedProcess([], 1, "", "")
+
 
 def _osa(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def ask(msg, title=APP):
+    if LINUX:
+        return _zenity("--question", "--no-markup", "--width=460", f"--text={msg}").returncode == 0
     if E.WIN:
         import ctypes
         flags = 0x04 | 0x20 | 0x10000 | 0x40000          # yes/no, question, foreground, topmost
@@ -99,6 +123,9 @@ def ask(msg, title=APP):
 
 
 def tell(msg, title=APP, problem=False):
+    if LINUX:
+        _zenity("--error" if problem else "--info", "--no-markup", "--width=460", f"--text={msg}")
+        return
     if E.WIN:
         import ctypes
         flags = (0x10 if problem else 0x40) | 0x10000 | 0x40000
@@ -114,6 +141,11 @@ def choose(prompt, options, title=APP):
     """Pick one of `options` (strings). Returns it, or None if cancelled."""
     if not options:
         return None
+    if LINUX:
+        r = _zenity("--list", "--hide-header", "--column=Option", "--width=520",
+                    f"--height={160 + 28 * len(options)}", f"--text={prompt}", *options)
+        out = r.stdout.strip()
+        return out if out in options else None
     if E.MAC:
         items = "{" + ", ".join(_osa(o) for o in options) + "}"
         r = subprocess.run(["osascript", "-e",
@@ -155,6 +187,9 @@ def choose(prompt, options, title=APP):
 
 def ask_secret(prompt, title=APP):
     """Type a passphrase (hidden). Returns it, or None if cancelled."""
+    if LINUX:
+        r = _zenity("--entry", "--hide-text", "--width=460", f"--text={prompt}")
+        return r.stdout.rstrip("\n") if r.returncode == 0 else None
     if E.MAC:
         r = subprocess.run(["osascript", "-e",
                             f'display dialog {_osa(prompt)} with title {_osa(title)} default answer "" '
@@ -192,6 +227,9 @@ def ask_secret(prompt, title=APP):
 
 def pick_folder(prompt, title=APP):
     """Choose a folder. Returns its path, or None if cancelled."""
+    if LINUX:
+        r = _zenity("--file-selection", "--directory")
+        return r.stdout.strip().rstrip("/") or None if r.returncode == 0 else None
     if E.MAC:
         r = subprocess.run(["osascript", "-e", f"POSIX path of (choose folder with prompt {_osa(prompt)})"],
                            capture_output=True, text=True)
@@ -207,10 +245,16 @@ def pick_folder(prompt, title=APP):
 
 
 def copy_text(text):
+    if LINUX:
+        cmd = (["wl-copy"] if shutil.which("wl-copy") else
+               ["xclip", "-selection", "clipboard"] if shutil.which("xclip") else None)
+    else:
+        cmd = ["clip"] if E.WIN else ["pbcopy"]
+    if not cmd:
+        return
     try:
-        subprocess.run(["clip"] if E.WIN else ["pbcopy"], input=text, text=True,
-                       creationflags=E.NO_WINDOW, check=False)
-    except OSError:
+        subprocess.run(cmd, input=text, text=True, creationflags=E.NO_WINDOW, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 
@@ -229,6 +273,14 @@ def show_github_code(code, url):
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 PLIST = os.path.expanduser("~/Library/LaunchAgents/uk.co.nigelisted.companionsync.plist")
+AUTOSTART = os.path.expanduser("~/.config/autostart/companion-sync-tray.desktop")
+
+
+def linux_autostart_entry():
+    return ("[Desktop Entry]\nType=Application\nName=Companion Sync\n"
+            "Comment=Share one Companion config between rigs\n"
+            f"Exec={sys.executable} {os.path.abspath(__file__)} --login\n"
+            "Icon=/opt/companion-sync/icon.png\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
 
 
 def _mac_app_path():
@@ -245,10 +297,20 @@ def login_enabled():
                 return True
         except OSError:
             return False
+    if LINUX:
+        return os.path.exists(AUTOSTART)
     return os.path.exists(PLIST)
 
 
 def set_login(on):
+    if LINUX:
+        if on:
+            os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+            with open(AUTOSTART, "w") as f:
+                f.write(linux_autostart_entry())
+        elif os.path.exists(AUTOSTART):
+            os.remove(AUTOSTART)
+        return
     if not getattr(sys, "frozen", False):
         return                                   # only for the built app
     if E.WIN:
@@ -310,6 +372,11 @@ class App:
         self.companion_was_running = False
         self.warned_not_holding = False
         self.work = threading.Lock()
+        # On the Pi, a systemd timer may already save every 15 minutes (headless
+        # install); then the tray app leaves saving to it.
+        self.timer_saves = LINUX and subprocess.run(
+            ["systemctl", "is-enabled", "--quiet", "companion-sync-save.timer"],
+            capture_output=True).returncode == 0
         self.icon = pystray.Icon(APP, make_icon("busy"), APP, menu=self.menu())
 
     # -- menu --
@@ -380,7 +447,9 @@ class App:
     def notify(self, msg):
         log.info(msg)
         try:
-            if E.MAC:
+            if LINUX:
+                subprocess.run(["notify-send", "--app-name", APP, APP, msg], capture_output=True, timeout=10)
+            elif E.MAC:
                 subprocess.run(["osascript", "-e",
                                 f"display notification {_osa(msg)} with title {_osa(APP)}"])
             else:
@@ -410,8 +479,12 @@ class App:
             self.set_state("free", "Config is free")
 
     # -- actions --
-    def open_companion(self):
-        if E.companion_running(self.s):
+    def open_companion(self, auto=False):
+        """Take the config and start Companion. auto=True: run at login (see
+        login_action), so a service's admin page isn't opened in the browser."""
+        managed = E.companion_managed(self.s)     # Pi: service or container, started by us
+        running = E.companion_running(self.s)
+        if running and not managed:
             if self.mine:
                 self.notify("Companion is already open, and this rig has the config.")
             else:
@@ -423,6 +496,7 @@ class App:
             self.mine = True
             self.last_save = None
             self.notify(msg)
+            self.show_admin(managed, auto)
         except E.NeedsPassphrase:
             raise
         except E.NeedsUpdate as e:
@@ -433,12 +507,22 @@ class App:
                 self.notify(E.start_sharing(self.s))
                 self.mine = True
                 self.last_save = datetime.datetime.now()
-            if ask("Open Companion now?"):
-                E.start_companion(self.s)
+            if (managed and running) or ask("Open Companion now?"):
+                if not E.companion_running(self.s):
+                    E.start_companion(self.s)
+                self.show_admin(managed, auto)
         except E.SyncError as e:
-            if ask(f"{e}\n\nOpen Companion anyway, with this rig's own copy?\n"
-                   f"(Changes won't be kept.)"):
+            if managed and running:
+                tell(f"{e}\n\nCompanion keeps running with this rig's own copy. Changes won't be kept.")
+            elif ask(f"{e}\n\nOpen Companion anyway, with this rig's own copy?\n"
+                     f"(Changes won't be kept.)"):
                 E.start_companion(self.s)
+                self.show_admin(managed, auto)
+
+    def show_admin(self, managed, auto):
+        """A service or container has no window: open its admin page instead."""
+        if managed and not auto and self.s.admin_url:
+            webbrowser.open(self.s.admin_url)
 
     def save_now(self):
         msg = E.save(self.s)
@@ -523,6 +607,14 @@ class App:
             tell(E.turn_off_encryption(self.s))
 
     def update_app(self):
+        if LINUX:
+            tell(f"Your browser will download the latest {APP} for the Pi.\n\n"
+                 f"When it's downloaded, in a terminal:\n\n"
+                 f"  tar xzf ~/Downloads/Companion-Sync-Pi.tar.gz -C /tmp\n"
+                 f"  sudo /tmp/companion-sync/pi/install.sh\n\n"
+                 f"Then quit {APP} from this menu and open it again.")
+            webbrowser.open(UPDATE_URL)
+            return
         tell(f"Your browser will download the latest {APP}.\n\n"
              f"When it's downloaded: quit {APP} from this menu, replace the old "
              f"{'Companion Sync.exe' if E.WIN else 'Companion Sync app in Applications'} "
@@ -645,7 +737,7 @@ class App:
         if E.WIN:
             os.startfile(p)
         else:
-            subprocess.run(["open", p])
+            subprocess.run(["xdg-open" if LINUX else "open", p])
 
     def quit(self):
         self.icon.stop()
@@ -664,7 +756,9 @@ class App:
 
     def tick(self, next_save):
         running = E.companion_running(self.s)
-        quit_now = self.companion_was_running and not running
+        # A service or container is stopped by takes and updates, not by quitting:
+        # only a desktop app being quit returns the config.
+        quit_now = self.companion_was_running and not running and not E.companion_managed(self.s)
         self.companion_was_running = running
         if not self.work.acquire(blocking=False):
             return
@@ -682,7 +776,8 @@ class App:
                 self.warned_not_holding = True
                 self.notify("Companion is open but this rig doesn't have the config. "
                             "Changes won't be kept.")
-            elif time.time() >= next_save and (self.mine or os.path.exists(self.s.holding_file)):
+            elif (time.time() >= next_save and not self.timer_saves
+                  and (self.mine or os.path.exists(self.s.holding_file))):
                 if E.save(self.s, quiet=True):
                     self.last_save = datetime.datetime.now()
                 self.refresh(force=True)
@@ -703,6 +798,8 @@ class App:
             self.refresh(force=True)
             if not E.signed_in(self.s):
                 self.notify(f"Not signed in to {self.s.place}. Choose 'Sign in' from the menu.")
+            elif self.s.login_action == "take_and_open" and LOGGED_IN_START:
+                self.bg(lambda: self.open_companion(auto=True))()
             threading.Thread(target=self.loop, daemon=True).start()
         self.icon.run(setup=setup)
 
@@ -714,7 +811,7 @@ def main():
         guard.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
     except OSError:
         tell(f"{APP} is already running. Look for its icon by the clock "
-             f"(Windows) or in the menu bar (Mac).")
+             f"(Windows, Pi) or in the menu bar (Mac).")
         return
     log.info("started")
     App().run()

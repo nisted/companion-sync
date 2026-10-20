@@ -15,6 +15,10 @@ of your choice (Google Drive, GitHub, Dropbox, OneDrive, a network folder or iCl
   companion-sync encryption on|off
                           encrypt the stored config (or stop), from the rig that has it
 
+On Linux (the Pi), Companion can run as CompanionPi's service, the desktop
+app or a Docker container; which one is detected, or set in
+~/.config/companion-sync/settings.json ("companion_mode").
+
 Only one rig holds the config at a time. The holder saves every 15 minutes
 (SQLite live backup, so Companion keeps running). A lock not refreshed for
 24 hours can be taken over, after asking. Take replaces the config, so on a
@@ -108,6 +112,19 @@ class Settings:
     github_app_slug: str = ""          # the GitHub App's name in its web address, for the 'limited' install link
     github_http: object = None         # tests only: stands in for the GitHub API
     companion_app: str = ""            # desktop: what to launch
+    # How Companion runs on a Linux rig (the Pi): 'service' (CompanionPi's systemd
+    # service), 'desktop' (the normal desktop app) or 'docker' (a container).
+    # Worked out by detect_companion_mode unless the settings file says.
+    companion_mode: str = ""
+    companion_base: str = ""           # settings file: Companion's config folder, if not the usual one
+    companion_process: list = field(default_factory=lambda: ["companion-launc", "Companion", "companion"])
+    companion_owner: str = ""          # 'user:group' to give installed files ('' = whoever owns the folder)
+    sudo_files: bool = False           # Companion's files belong to another user, so use sudo
+    docker_container: str = "companion"
+    docker_config_path: str = "/companion"   # where the container keeps its config
+    admin_url: str = "http://127.0.0.1:8000"
+    login_action: str = "tray_only"    # tray app at login: 'take_and_open' or 'tray_only'
+    settings_file: str = ""            # this rig's own settings (see RIG_SETTINGS)
     keep_local: int = 5
     keep_history: int = 30
     stale_hours: float = 24
@@ -189,18 +206,126 @@ def default_settings(**kw):
         s = Settings("mac", _pick_base(sup), os.path.join(sup, "companion-sync-safety-copies"),
                      os.path.join(home, ".companion-sync-holding"), companion_app="Companion")
     else:
-        s = Settings("pi", "/home/companion/.config/companion-nodejs",
-                     "/home/companion/.config/companion-sync-safety-copies",
-                     os.path.join(home, ".companion-sync-holding"))
+        s = Settings("pi", "", "", os.path.join(home, ".companion-sync-holding"),
+                     login_action="take_and_open")
     s.rig = stable_rig_name(os.path.join(home, ".companion-sync-rig-name"))
     s.state_file = os.path.join(home, ".companion-sync-state.json")
     s.storage_file = os.path.join(home, ".companion-sync-storage.json")
     s.github_token_file = os.path.join(home, ".companion-sync-github.json")
     s.key_file = os.path.join(home, ".companion-sync-key.json")
+    s.settings_file = os.path.join(home, ".config", "companion-sync", "settings.json")
     for k, v in kw.items():
         setattr(s, k, v)
+    load_rig_settings(s)
+    if s.platform == "pi":
+        configure_linux(s)
+    elif s.companion_base:
+        s.base = s.companion_base
     load_storage_choice(s)
     return s
+
+
+# ---- this rig's own settings -----------------------------------------------
+# ~/.config/companion-sync/settings.json, all optional, e.g.
+#   {"companion_mode": "docker", "docker_container": "companion",
+#    "login_action": "tray_only"}
+
+RIG_SETTINGS = ("companion_mode", "companion_base", "companion_app", "companion_process",
+                "companion_owner", "docker_container", "docker_config_path", "admin_url",
+                "login_action", "keep_local", "keep_history", "stale_hours")
+COMPANION_MODES = ("service", "desktop", "docker")
+LOGIN_ACTIONS = ("take_and_open", "tray_only")
+
+
+def load_rig_settings(s):
+    try:
+        with open(s.settings_file) as f:
+            saved = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return
+    if not isinstance(saved, dict):
+        return
+    for k in RIG_SETTINGS:
+        if k in saved and saved[k] not in (None, ""):
+            setattr(s, k, saved[k])
+    if s.companion_mode == "auto":
+        s.companion_mode = ""
+    if s.login_action not in LOGIN_ACTIONS:
+        s.login_action = "tray_only"
+
+
+def _docker(s, *args):
+    """A docker command, through sudo if this user isn't in the docker group."""
+    r = run(["docker", *args], check=False)
+    if r.returncode != 0 and "permission denied" in r.stderr.lower():
+        r = run(["sudo", "-n", "docker", *args], check=False)
+    return r
+
+
+def detect_companion_mode(s):
+    """Linux: a Docker container called s.docker_container, else CompanionPi's
+    service, else the desktop app."""
+    if shutil.which("docker") and _docker(s, "inspect", s.docker_container).returncode == 0:
+        return "docker"
+    if shutil.which("systemctl"):
+        r = run(["systemctl", "list-unit-files", "companion.service", "--no-legend"], check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return "service"
+    return "desktop"
+
+
+def _docker_config_dir(s):
+    """The folder on this machine that the container uses as its config folder."""
+    r = _docker(s, "inspect", "-f", "{{json .Mounts}}", s.docker_container)
+    try:
+        for m in json.loads(r.stdout or "[]"):
+            if m.get("Destination", "").rstrip("/") == s.docker_config_path.rstrip("/"):
+                return m.get("Source")
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def find_linux_companion():
+    """The desktop Companion to launch on Linux, or ''."""
+    home = os.path.expanduser("~")
+    import glob
+    for p in (shutil.which("companion-launcher"),
+              "/opt/companion/companion-launcher",
+              os.path.join(home, "companion", "companion-launcher"),
+              *sorted(glob.glob(os.path.join(home, "Applications", "*ompanion*.AppImage"))),
+              *sorted(glob.glob(os.path.join(home, "*ompanion*.AppImage")))):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+def configure_linux(s):
+    """Work out how Companion runs on this Linux rig and where its config is."""
+    home = os.path.expanduser("~")
+    if s.companion_mode not in COMPANION_MODES:
+        s.companion_mode = detect_companion_mode(s)
+    if s.companion_mode == "service":
+        s.base = s.companion_base or "/home/companion/.config/companion-nodejs"
+        s.companion_owner = s.companion_owner or "companion:companion"
+    elif s.companion_mode == "docker":
+        s.base = s.companion_base or _docker_config_dir(s) or ""
+    else:
+        s.base = s.companion_base or _pick_base(os.path.join(home, ".config"))
+        s.companion_app = s.companion_app or find_linux_companion()
+    s.safety_dir = os.path.join(os.path.dirname(s.base.rstrip("/")) or home, "companion-sync-safety-copies")
+    here = s.base if os.path.exists(s.base) else os.path.dirname(s.base.rstrip("/"))
+    # A service's files belong to the 'companion' user; a container often writes as root.
+    s.sudo_files = (s.companion_mode in ("service", "docker")
+                    or not (here and os.access(here, os.W_OK | os.X_OK)))
+
+
+def _owner(s):
+    """'user:group' for files put into Companion's folder."""
+    if s.companion_owner:
+        return s.companion_owner
+    r = run(["sudo", "stat", "-c", "%u:%g", s.base], check=False)
+    return r.stdout.strip() or "root:root"
 
 
 # ---- running things --------------------------------------------------------
@@ -1256,18 +1381,18 @@ def connect_github(s, mode, show_code, choose_repo):
 
 
 def _sudo(s, cmd):
-    return ["sudo"] + cmd if s.platform == "pi" else cmd
+    return ["sudo"] + cmd if s.sudo_files else cmd
 
 
 def listdir(s, path):
-    if s.platform == "pi":
+    if s.sudo_files:
         r = run(["sudo", "ls", path], check=False)
         return r.stdout.split() if r.returncode == 0 else []
     return os.listdir(path) if os.path.isdir(path) else []
 
 
 def isdir(s, path):
-    if s.platform == "pi":
+    if s.sudo_files:
         return run(["sudo", "test", "-d", path], check=False).returncode == 0
     return os.path.isdir(path)
 
@@ -1278,8 +1403,9 @@ def local_version(s):
     """The newest version folder Companion has on this rig, e.g. 'v5.0'."""
     vs = [n for n in listdir(s, s.base) if vkey(n)]
     if not vs:
-        raise SyncError(f"Can't find Companion's config in\n  {s.base}\n"
-                        f"Has Companion been run on this rig at least once?")
+        raise SyncError(f"Can't find Companion's config in\n  {s.base or '(no folder found)'}\n"
+                        f"Has Companion been run on this rig at least once? (Its folder can be set "
+                        f"with companion_base in {s.settings_file or 'the settings file'}.)")
     return max(vs, key=vkey)
 
 
@@ -1295,25 +1421,66 @@ def drive_version(s):
 
 def companion_running(s):
     if s.platform == "pi":
-        return run(["systemctl", "is-active", "--quiet", "companion"], check=False).returncode == 0
+        if s.companion_mode == "service":
+            return run(["systemctl", "is-active", "--quiet", "companion"], check=False).returncode == 0
+        if s.companion_mode == "docker":
+            r = _docker(s, "inspect", "-f", "{{.State.Running}}", s.docker_container)
+            return r.stdout.strip() == "true"
+        names = s.companion_process if isinstance(s.companion_process, list) else [s.companion_process]
+        return any(run(["pgrep", "-x", n[:15]], check=False).returncode == 0 for n in names if n)
     if s.platform == "win":
         out = run(["tasklist", "/FI", "IMAGENAME eq Companion.exe", "/NH"], check=False).stdout
         return "companion.exe" in out.lower()
     return run(["pgrep", "-x", "Companion"], check=False).returncode == 0
 
 
+def describe_companion(s):
+    """How Companion runs on this rig, in plain words."""
+    if s.platform != "pi":
+        return f"desktop app, config in {s.base}"
+    if s.companion_mode == "service":
+        return f"system service, config in {s.base}"
+    if s.companion_mode == "docker":
+        return f"Docker container '{s.docker_container}', config in {s.base or '(not found)'}"
+    return f"desktop app ({s.companion_app or 'not found'}), config in {s.base}"
+
+
+def companion_managed(s):
+    """True where Companion Sync stops and starts Companion itself (service,
+    container); False where it's an app the person opens and quits."""
+    return s.platform == "pi" and s.companion_mode in ("service", "docker")
+
+
 def stop_companion(s):
-    if s.platform == "pi":
+    if s.platform == "pi" and s.companion_mode == "service":
         s.log("Stopping Companion...")
         run(["sudo", "systemctl", "stop", "companion"])
+    elif s.platform == "pi" and s.companion_mode == "docker":
+        s.log("Stopping Companion's container...")
+        r = _docker(s, "stop", s.docker_container)
+        if r.returncode != 0:
+            raise SyncError(f"Couldn't stop the {s.docker_container} container:\n{r.stderr.strip()}")
     elif companion_running(s):
         raise SyncError("Companion is open. Quit it first, then try again.")
 
 
 def start_companion(s):
-    if s.platform == "pi":
+    if s.platform == "pi" and s.companion_mode == "service":
         s.log("Starting Companion...")
         run(["sudo", "systemctl", "start", "companion"])
+    elif s.platform == "pi" and s.companion_mode == "docker":
+        s.log("Starting Companion's container...")
+        r = _docker(s, "start", s.docker_container)
+        if r.returncode != 0:
+            raise SyncError(f"Couldn't start the {s.docker_container} container:\n{r.stderr.strip()}")
+    elif s.platform == "pi":
+        if not s.companion_app:
+            s.log("Couldn't find Companion. Start it yourself, or set companion_app in "
+                  f"{s.settings_file}.")
+            return
+        s.log("Starting Companion...")
+        subprocess.Popen([s.companion_app], close_fds=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     elif s.platform == "win":
         if not s.companion_app:
             s.log("Couldn't find Companion.exe. Start Companion yourself.")
@@ -1355,8 +1522,8 @@ def _snapshot_local(src_dir, dest):
 
 def snapshot(s, version, dest):
     src = os.path.join(s.base, version)
-    if s.platform == "pi":
-        # Companion's files belong to the 'companion' user, so snapshot as root
+    if s.sudo_files:
+        # Companion's files belong to another user (service, container), so snapshot as root
         run(["sudo", sys.executable, os.path.abspath(__file__), "_snapshot", src, dest])
         run(["sudo", "chown", "-R", os.environ.get("USER", "root"), dest])
     else:
@@ -1369,19 +1536,19 @@ def tidy_safety_copies(s):
     They must live outside it: Companion treats any folder next to v5.0 as
     another version of itself and complains on start-up.
     """
-    if s.platform == "pi":
+    if s.sudo_files:
         run(["sudo", "mkdir", "-p", s.safety_dir])
     else:
         os.makedirs(s.safety_dir, exist_ok=True)
     for n in listdir(s, s.base):
         if ".before-" in n and vkey(n.split(".before-")[0]):
             a, b = os.path.join(s.base, n), os.path.join(s.safety_dir, n)
-            run(["sudo", "mv", a, b]) if s.platform == "pi" else shutil.move(a, b)
+            run(["sudo", "mv", a, b]) if s.sudo_files else shutil.move(a, b)
     copies = sorted((n for n in listdir(s, s.safety_dir) if ".before-" in n),
                     key=lambda n: n.split(".before-")[1][-17:])
     for n in copies[:-s.keep_local]:
         p = os.path.join(s.safety_dir, n)
-        run(["sudo", "rm", "-rf", p]) if s.platform == "pi" else shutil.rmtree(p, ignore_errors=True)
+        run(["sudo", "rm", "-rf", p]) if s.sudo_files else shutil.rmtree(p, ignore_errors=True)
 
 
 def _move_to_safety(s, version, reason):
@@ -1389,7 +1556,7 @@ def _move_to_safety(s, version, reason):
     if not isdir(s, src):
         return None
     dst = os.path.join(s.safety_dir, f"{version}.before-{reason}-{now()}")
-    run(["sudo", "mv", src, dst]) if s.platform == "pi" else shutil.move(src, dst)
+    run(["sudo", "mv", src, dst]) if s.sudo_files else shutil.move(src, dst)
     return dst
 
 
@@ -1398,11 +1565,12 @@ def install_config(s, version, src):
     tidy_safety_copies(s)
     target = os.path.join(s.base, version)
     safety = os.path.join(s.safety_dir, f"{version}.before-take-{now()}")
-    if s.platform == "pi":
+    if s.sudo_files:
+        owner = _owner(s)
         run(["sudo", "mkdir", "-p", target])
         run(["sudo", "cp", "-a", target, safety])
         run(["sudo", "rsync", "-a", "--delete", "--exclude", "backups/", f"{src}/", f"{target}/"])
-        run(["sudo", "chown", "-R", "companion:companion", target])
+        run(["sudo", "chown", "-R", owner, target])
     else:
         os.makedirs(target, exist_ok=True)
         shutil.copytree(target, safety)
@@ -1516,8 +1684,8 @@ def _drive_module_folders(s, sub):
 
 
 def _copy_folder(s, src, dst):
-    """Copy a module folder; on the Pi, Companion's folders belong to the 'companion' user."""
-    if s.platform == "pi":
+    """Copy a module folder; Companion's folders may belong to another user (service, container)."""
+    if s.sudo_files:
         run(["sudo", "mkdir", "-p", os.path.dirname(dst)])
         run(["sudo", "cp", "-a", src, dst])
     else:
@@ -1536,7 +1704,7 @@ def upload_modules(s):
                     continue
                 staged = os.path.join(tmp, sub, name)
                 _copy_folder(s, os.path.join(s.base, sub, name), staged)
-                if s.platform == "pi":
+                if s.sudo_files:
                     run(["sudo", "chown", "-R", os.environ.get("USER", "root"), os.path.join(tmp, sub)])
                 store.copy_up(staged, f"modules/{sub}/{name}")
                 added.append(name)
@@ -1571,8 +1739,8 @@ def download_modules(s):
                     continue
                 dst = os.path.join(s.base, sub, name)
                 _copy_folder(s, dl, dst)
-                if s.platform == "pi":
-                    run(["sudo", "chown", "-R", "companion:companion", dst])
+                if s.sudo_files:
+                    run(["sudo", "chown", "-R", _owner(s), dst])
                 added.append(name)
     return added
 
@@ -1626,6 +1794,8 @@ def take(s, confirm_takeover=None, manage_companion=True):
     h = lock_holder(s)
     if h and holder_name(h) == s.rig:
         mark_holding(s, True)
+        if manage_companion and not companion_running(s):
+            start_companion(s)
         return f"This rig ({s.rig}) already has the config."
     if h:
         age = lock_age_hours(s)
@@ -2070,6 +2240,7 @@ def main(argv):
                 print("Config is free.")
             print(f"{s.place} has Companion {vtext(st['drive_version'])} config; "
                   f"this rig has {vtext(local_version(s))}.")
+            print(f"Companion on this rig: {describe_companion(s)}")
             if st["stranded"]:
                 print("This rig's lock was taken over; its next save goes to 'stranded'.")
         elif cmd == "take":

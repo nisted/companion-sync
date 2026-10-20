@@ -457,7 +457,69 @@ def t_sign_in_elsewhere(w):
     expect_error(lambda: E.connect_rclone_elsewhere(a, "onedrive", lambda help: ""), "nothing was pasted")
 
 
-SCENARIOS = [t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def t_linux_companion_modes(w):
+    """Pi: Companion found as a Docker container, CompanionPi's service or the
+    desktop app, and the settings file overrides what's found."""
+    if w.kind != "folder":
+        return
+    import json
+    home = os.path.join(w.tmp, "pi-home")
+    mount = os.path.join(w.tmp, "docker-config")
+    os.makedirs(os.path.join(home, ".config", "companion-nodejs", "v5.0"))
+    os.makedirs(os.path.join(mount, "v5.0"))
+    have = {"docker": False, "service": False}
+
+    def fake_run(cmd, check=True, input=None):
+        out, code = "", 1
+        if cmd[:2] == ["docker", "inspect"] and have["docker"]:
+            code = 0
+            out = json.dumps([{"Source": mount, "Destination": "/companion"}]) if "-f" in cmd else "[]"
+        elif cmd[:2] == ["systemctl", "list-unit-files"] and have["service"]:
+            out, code = "companion.service enabled enabled\n", 0
+        return subprocess.CompletedProcess(cmd, code, out, "")
+
+    def settings(**saved):
+        s = E.Settings("pi", "", "", os.path.join(home, "holding"))
+        s.settings_file = os.path.join(home, "settings.json")
+        with open(s.settings_file, "w") as f:
+            json.dump(saved, f)
+        E.load_rig_settings(s)
+        E.configure_linux(s)
+        return s
+
+    old = (E.run, E.shutil.which, os.environ.get("HOME"))
+    E.run, E.shutil.which = fake_run, (lambda n: f"/usr/bin/{n}")
+    os.environ["HOME"] = home
+    try:
+        s = settings()
+        assert s.companion_mode == "desktop" and not E.companion_managed(s), s.companion_mode
+        assert s.base == os.path.join(home, ".config", "companion-nodejs") and not s.sudo_files
+        assert s.safety_dir == os.path.join(home, ".config", "companion-sync-safety-copies")
+        assert E.local_version(s) == "v5.0"
+
+        have["service"] = True
+        s = settings()
+        assert s.companion_mode == "service" and s.sudo_files and E.companion_managed(s)
+        assert s.base == "/home/companion/.config/companion-nodejs" and s.companion_owner == "companion:companion"
+
+        have["docker"] = True                                    # a container wins over the service
+        s = settings()
+        assert s.companion_mode == "docker" and s.base == mount and E.companion_managed(s), (s.companion_mode, s.base)
+        assert "Docker container 'companion'" in E.describe_companion(s)
+
+        s = settings(companion_mode="desktop", companion_base=mount, login_action="nonsense")
+        assert s.companion_mode == "desktop" and s.base == mount and s.login_action == "tray_only"
+        s = settings(companion_mode="auto", docker_container="cs", admin_url="http://bd-1:8000")
+        assert s.companion_mode == "docker" and s.docker_container == "cs" and s.admin_url == "http://bd-1:8000"
+    finally:
+        E.run, E.shutil.which = old[0], old[1]
+        if old[2] is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old[2]
+
+
+SCENARIOS = [t_linux_companion_modes, t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

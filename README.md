@@ -15,7 +15,7 @@ From the [latest release](https://github.com/nisted/companion-sync/releases/late
 | --- | --- |
 | `Companion-Sync-Windows.exe` | Windows: a tray app |
 | `Companion-Sync-Mac.zip` | Mac (Apple silicon): a menu-bar app |
-| `Companion-Sync-Pi.tar.gz` | Raspberry Pi running Companion as a service (e.g. CompanionPi) |
+| `Companion-Sync-Pi.tar.gz` | Raspberry Pi: a tray app on a Pi with a desktop, or headless (command and services) |
 
 ## Set up
 
@@ -24,12 +24,21 @@ whose config you want to keep, choose **Open Companion** and say yes to putting 
 every other rig with the same storage and account. From then on, open Companion from the Companion Sync menu.
 
 **Raspberry Pi:** unpack, install, then choose the storage. No screen is needed.
+On a Pi with a desktop, the installer also adds the tray app (same menu as Windows / Mac) and starts it at
+login; `--headless` leaves it out.
 
 ```
 tar xzf Companion-Sync-Pi.tar.gz
-sudo ./companion-sync/pi/install.sh
+sudo ./companion-sync/pi/install.sh              # or: --headless, --tray, --panel
 companion-sync setup
 ```
+
+Companion on the Pi can be CompanionPi's service, the desktop app or a Docker container (with its config folder
+bind-mounted from the Pi); it's detected, and `companion-sync status` says which. To set it, or anything else
+for this rig, copy `~/.config/companion-sync/settings.json.example` to `settings.json` and keep only what
+you change. `login_action` decides whether the tray app takes the config and opens Companion at login
+(`take_and_open`, the Pi's default) or just shows the icon (`tray_only`). With a service or container, Open
+Companion opens its admin page, and the config isn't returned when Companion stops: use **Return config**.
 
 Run `setup` as your normal user, without sudo. GitHub signs in with a code typed on your phone; a network folder
 just needs mounting; Google Drive, Dropbox and OneDrive give a command to run on any computer with a browser,
@@ -51,9 +60,10 @@ Pi commands: `companion-sync status | take | save | return | setup | unlock | en
 ## For developers
 
 - `engine.py`: all the sync logic and storage back-ends; on the Pi it's also the `companion-sync` command.
-- `app.py`: the Windows / Mac tray app.
+- `app.py`: the Windows / Mac / Pi desktop tray app (on the Pi: zenity dialogs, AppIndicator icon).
 - `panel/`: an optional 2.4" SPI touchscreen panel for the Pi (`install.sh --panel`).
-- `pi/`: the Pi services (start-up take before Companion, 15-minute saves) and `install.sh`.
+- `pi/`: the Pi services (start-up take before Companion or Docker, 15-minute saves), `install.sh` and
+  `settings.example.json`.
 - `tests/`: scenario tests against a local folder, rclone and a fake GitHub: `python3 tests/test_engine.py`.
 - `.github/workflows/build.yml`: builds and publishes a release on every push to `main`.
   Google sign-in details come from the repository secrets `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.

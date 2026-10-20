@@ -1,0 +1,28 @@
+{
+  "_help": "Copy to settings.json beside this file and keep only what you change. Leave a value out to use the default.",
+
+  "companion_mode": "auto",
+  "_companion_mode": "auto (detect), service (CompanionPi), desktop (the desktop app) or docker",
+
+  "companion_base": "",
+  "_companion_base": "Companion's config folder, the one holding v5.0, if it isn't found by itself",
+
+  "companion_app": "",
+  "_companion_app": "desktop: the program to start, e.g. /opt/companion/companion-launcher or an AppImage",
+
+  "companion_process": ["companion-launc", "Companion", "companion"],
+  "_companion_process": "desktop: process names that mean Companion is open",
+
+  "docker_container": "companion",
+  "docker_config_path": "/companion",
+  "_docker": "docker: the container's name, and where it keeps its config inside the container",
+
+  "companion_owner": "",
+  "_companion_owner": "service/docker: user:group for config files put in place ('' = whoever owns the folder)",
+
+  "admin_url": "http://127.0.0.1:8000",
+  "_admin_url": "service/docker: the page Open Companion opens",
+
+  "login_action": "take_and_open",
+  "_login_action": "tray icon at login: take_and_open, or tray_only (choose Open Companion yourself)"
+}
