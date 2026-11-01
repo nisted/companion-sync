@@ -13,9 +13,20 @@ From the [latest release](https://github.com/nisted/companion-sync/releases/late
 
 | File | For |
 | --- | --- |
-| `Companion-Sync-Windows.exe` | Windows: a tray app |
+| `Companion-Sync-Setup.exe` | Windows: installer for the tray app (just for you, no admin needed) |
+| `Companion-Sync-Windows.exe` | Windows: the same app on its own, without installing |
 | `Companion-Sync-Mac.zip` | Mac (Apple silicon): a menu-bar app |
 | `Companion-Sync-Pi.tar.gz` | Raspberry Pi: a tray app on a Pi with a desktop, or headless (command and services) |
+
+## Updating
+
+Choose **Update Companion Sync…** in the menu. It checks for a newer build, downloads it, installs it and
+opens it again, on all three:
+
+- **Windows:** runs the installer quietly. The first update from a loose `Companion Sync.exe` moves the app
+  into the installed copy (Start menu, uninstaller); the old exe can then be deleted. Start at login follows it.
+- **Mac:** replaces the app where it is (it needs to be somewhere you can write to, e.g. Applications).
+- **Pi:** runs `pi/install.sh --from-update`, asking for the password if sudo needs one.
 
 ## Set up
 

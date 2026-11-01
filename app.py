@@ -15,14 +15,18 @@ by updates and takes); return it from the menu instead.
 """
 import dataclasses
 import datetime
+import json
 import logging
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.request
 import webbrowser
 
 import pystray
@@ -47,9 +51,11 @@ except ImportError:
 
 LINUX = not E.WIN and not E.MAC
 RELEASES = "https://github.com/nisted/companion-sync/releases/latest"
-UPDATE_URL = RELEASES + ("/download/Companion-Sync-Windows.exe" if E.WIN else
-                         "/download/Companion-Sync-Mac.zip" if E.MAC else
-                         "/download/Companion-Sync-Pi.tar.gz")
+LATEST_API = "https://api.github.com/repos/nisted/companion-sync/releases/latest"
+UPDATE_ASSET = ("Companion-Sync-Setup.exe" if E.WIN else
+                "Companion-Sync-Mac.zip" if E.MAC else
+                "Companion-Sync-Pi.tar.gz")
+WIN_MUTEX = "CompanionSyncRunning"      # the Windows installer waits for this to go
 
 
 # Windows: a left-click on the tray icon opens the menu, like a right-click,
@@ -85,6 +91,34 @@ def bundled(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     p = os.path.join(base, name)
     return p if os.path.exists(p) else None
+
+
+def fetch(url, dest=None):
+    """Download `url`: returns the bytes, or saves them to `dest`.
+    The Mac uses curl, which trusts the system's certificates."""
+    if E.MAC:
+        cmd = ["/usr/bin/curl", "-fsSL", "--max-time", "300", "-H", "User-Agent: companion-sync", url]
+        r = subprocess.run(cmd + (["-o", dest] if dest else []), capture_output=True)
+        if r.returncode:
+            raise OSError(r.stderr.decode(errors="replace").strip() or f"curl failed ({r.returncode})")
+        return r.stdout
+    req = urllib.request.Request(url, headers={"User-Agent": "companion-sync"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        if not dest:
+            return r.read()
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+
+
+def child_env():
+    """Environment for starting another program from the built app (the
+    installer, the new app): without PyInstaller's own settings."""
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+    for k in [k for k in env if k.startswith(("_PYI", "_MEIPASS"))]:
+        env.pop(k)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
+    return env
 
 
 LOG_FILE = os.path.join(data_dir(), "companion-sync.log")
@@ -372,6 +406,7 @@ class App:
         self.companion_was_running = False
         self.warned_not_holding = False
         self.work = threading.Lock()
+        self.restart = False          # reopen after an update (Pi)
         # On the Pi, a systemd timer may already save every 15 minutes (headless
         # install); then the tray app leaves saving to it.
         self.timer_saves = LINUX and subprocess.run(
@@ -398,7 +433,7 @@ class App:
               checked=lambda i: login_enabled()),
             M("Open log", lambda: self.open_path(LOG_FILE)),
             pystray.Menu.SEPARATOR,
-            M(f"Update {APP}…", lambda: threading.Thread(target=self.update_app, daemon=True).start()),
+            M(f"Update {APP}…", self.bg(self.update_app)),
             M("Get Companion…", lambda: webbrowser.open(E.COMPANION_DOWNLOAD)),
             M(f"{APP} build {BUILD}", None, enabled=False),
             M(f"Quit {APP}", self.quit),
@@ -606,20 +641,88 @@ class App:
             self.set_state("busy", "Decrypting…")
             tell(E.turn_off_encryption(self.s))
 
+    # -- updating: download the latest release and install it, then reopen --
     def update_app(self):
-        if LINUX:
-            tell(f"Your browser will download the latest {APP} for the Pi.\n\n"
-                 f"When it's downloaded, in a terminal:\n\n"
-                 f"  tar xzf ~/Downloads/Companion-Sync-Pi.tar.gz -C /tmp\n"
-                 f"  sudo /tmp/companion-sync/pi/install.sh\n\n"
-                 f"Then quit {APP} from this menu and open it again.")
-            webbrowser.open(UPDATE_URL)
+        if not getattr(sys, "frozen", False) and not LINUX:
+            tell(f"This {APP} is running from source. Update it with git.")
             return
-        tell(f"Your browser will download the latest {APP}.\n\n"
-             f"When it's downloaded: quit {APP} from this menu, replace the old "
-             f"{'Companion Sync.exe' if E.WIN else 'Companion Sync app in Applications'} "
-             f"with the new one, and open it again.")
-        webbrowser.open(UPDATE_URL)
+        self.set_state("busy", "Checking for an update…")
+        try:
+            rel = json.loads(fetch(LATEST_API))
+        except Exception as e:
+            raise E.SyncError(f"Can't reach GitHub to check for an update. Are you online?\n{e}")
+        new = rel.get("tag_name", "").removeprefix("build-")
+        if BUILD != "dev" and new.isdigit() and str(BUILD).isdigit() and int(new) <= int(BUILD):
+            tell(f"You have the latest build ({BUILD}).")
+            return
+        asset = next((a for a in rel.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
+        if not asset:
+            tell(f"Build {new} has no {UPDATE_ASSET}. Your browser will open the download page.")
+            webbrowser.open(RELEASES)
+            return
+        if not ask(f"Update {APP} from build {BUILD} to build {new}?\n\n"
+                   f"{APP} closes for a moment and opens again. Companion keeps running."):
+            return
+        self.set_state("busy", f"Downloading build {new}…")
+        tmp = tempfile.mkdtemp(prefix="companion-sync-update-")
+        dest = os.path.join(tmp, UPDATE_ASSET)
+        try:
+            fetch(asset["browser_download_url"], dest)
+        except Exception as e:
+            raise E.SyncError(f"The download didn't finish. Try again.\n{e}")
+        log.info("update: build %s -> %s", BUILD, new)
+        self.set_state("busy", f"Installing build {new}…")
+        if E.WIN:
+            self._update_windows(dest)
+        elif E.MAC:
+            self._update_mac(dest, tmp)
+        else:
+            self._update_pi(dest, tmp, new)
+
+    def _update_windows(self, setup):
+        # The installer waits for this app to close, installs, then opens it again.
+        subprocess.Popen([setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                         env=child_env(), close_fds=True,
+                         creationflags=0x00000008 | 0x00000200)   # detached, own process group
+        self.quit()
+
+    def _update_mac(self, zip_path, tmp):
+        app = _mac_app_path()
+        if not app.endswith(".app") or not os.access(os.path.dirname(app), os.W_OK):
+            raise E.SyncError(f"Can't replace {app}.\nMove {APP} into Applications, then try again.")
+        unpacked = os.path.join(tmp, "new")
+        r = subprocess.run(["ditto", "-x", "-k", zip_path, unpacked], capture_output=True, text=True)
+        new_app = os.path.join(unpacked, f"{APP}.app")
+        if r.returncode or not os.path.isdir(new_app):
+            raise E.SyncError(f"The download couldn't be unpacked.\n{r.stderr.strip()}")
+        # swap the app over once this one has quit, then open it
+        script = os.path.join(tmp, "swap.sh")
+        with open(script, "w") as f:
+            f.write('while kill -0 "$1" 2>/dev/null; do sleep 0.5; done\n'
+                    'rm -rf "$2" && mv "$3" "$2"\n'
+                    'xattr -dr com.apple.quarantine "$2" 2>/dev/null\n'
+                    'open "$2"\n')
+        subprocess.Popen(["/bin/sh", script, str(os.getpid()), app, new_app],
+                         env=child_env(), start_new_session=True, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.quit()
+
+    def _update_pi(self, tgz, tmp, new):
+        with tarfile.open(tgz) as t:
+            t.extractall(tmp, filter="data")
+        installer = os.path.join(tmp, "companion-sync", "pi", "install.sh")
+        if not os.path.exists(installer):
+            raise E.SyncError("The download doesn't contain the installer.")
+        cmd = ["/bin/bash", installer, "--from-update"]
+        r = subprocess.run(["sudo", "-n", *cmd], capture_output=True, text=True)
+        if r.returncode and "password" in (r.stderr or "").lower():
+            r = subprocess.run(["pkexec", *cmd], capture_output=True, text=True)   # asks for the password
+        log.info("install.sh:\n%s%s", r.stdout, r.stderr)
+        if r.returncode:
+            out = (r.stdout + r.stderr).strip().splitlines()[-6:]
+            raise E.SyncError(f"Build {new} didn't install:\n" + "\n".join(out))
+        self.restart = True
+        self.quit()
 
     def offer_download(self, msg):
         if ask(f"{msg}\n\nOpen the Companion download page?"):
@@ -792,6 +895,8 @@ class App:
         if not login_enabled() and not os.path.exists(os.path.join(data_dir(), "first-run-done")):
             set_login(True)                         # start at login by default
             open(os.path.join(data_dir(), "first-run-done"), "w").close()
+        elif login_enabled() and not LINUX:
+            set_login(True)                         # point it at this copy (e.g. now installed elsewhere)
 
         def setup(icon):
             icon.visible = True
@@ -813,8 +918,16 @@ def main():
         tell(f"{APP} is already running. Look for its icon by the clock "
              f"(Windows, Pi) or in the menu bar (Mac).")
         return
+    if E.WIN:                       # lets the installer see that the app is open
+        import ctypes
+        global _mutex
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, WIN_MUTEX)
     log.info("started")
-    App().run()
+    app = App()
+    app.run()
+    if app.restart:                 # Pi, after an update: open the new copy
+        guard.close()
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
 
 if __name__ == "__main__":

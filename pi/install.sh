@@ -13,7 +13,8 @@
 # (see settings.json.example there).
 #
 # An update keeps the panel and the tray/headless choice as they were. The
-# panel's UPDATE CS button runs this from a downloaded release.
+# panel's UPDATE CS button and the tray app's "Update Companion Sync…" run
+# this from a downloaded release (with --from-update).
 # Afterwards, choose where the config is stored:  companion-sync setup
 set -euo pipefail
 
@@ -30,6 +31,7 @@ for a in "$@"; do
         --panel) PANEL=yes ;;
         --headless) TRAY_ARG=no ;;
         --tray) TRAY_ARG=yes ;;
+        --from-update) ;;      # run by the tray app's / panel's update: same as a plain update
         *) echo "Unknown option: $a"; exit 1 ;;
     esac
 done

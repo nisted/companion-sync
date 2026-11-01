@@ -11,6 +11,7 @@ Tick things off by editing this file.
 - [x] Windows and Mac tray apps (build 6): status icon, menu, auto-return on quit, start at login
 - [x] Nige's CS logo
 - [x] "Update Companion Sync" menu item and build number
+- [x] Windows installer; one-click update (download, install, reopen) on Windows, Mac and Pi
 - [x] "Get Companion" download page offered when a rig's Companion is too old
 - [x] Left-click on the tray icon opens the menu (Windows)
 - [x] Module sync: installed module versions (incl. custom imports) go to Drive on save/return and are copied onto a rig on take; `modules/modules.json` lists them

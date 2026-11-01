@@ -30,10 +30,20 @@ jobs:
           python icon.py
       - name: Build
         run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
+      - name: Installer
+        shell: pwsh
+        run: |
+          python -c "from PIL import Image; Image.open('icon.png').save('icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(256,256)])"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DBuild=${{ github.run_number }}" build\companion-sync.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: Companion-Sync-Windows
-          path: dist/Companion Sync.exe
+          path: |
+            dist/Companion Sync.exe
+            dist/Companion-Sync-Setup.exe
 
   mac:
     runs-on: macos-latest          # Apple silicon Macs
@@ -89,8 +99,8 @@ jobs:
           name: Companion-Sync-Pi
           path: Companion-Sync-Pi.tar.gz
 
-  # Publish each build from main as the latest release, so the app's
-  # "Update Companion Sync" menu item can link straight to the download.
+  # Publish each build from main as the latest release: the app's
+  # "Update Companion Sync" menu item downloads and installs it from here.
   release:
     if: github.ref == 'refs/heads/main'
     needs: [windows, mac, pi]
@@ -106,10 +116,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp "out/Companion-Sync-Windows/Companion Sync.exe" Companion-Sync-Windows.exe
+          cp out/Companion-Sync-Windows/Companion-Sync-Setup.exe Companion-Sync-Setup.exe
           cp out/Companion-Sync-Mac/Companion-Sync-Mac.zip Companion-Sync-Mac.zip
           cp out/Companion-Sync-Pi/Companion-Sync-Pi.tar.gz Companion-Sync-Pi.tar.gz
           gh release create "build-${{ github.run_number }}" \
-            Companion-Sync-Windows.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
+            Companion-Sync-Setup.exe Companion-Sync-Windows.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
             --repo "${{ github.repository }}" --latest \
             --title "Companion Sync build ${{ github.run_number }}" \
             --notes "Built from ${{ github.sha }}"
