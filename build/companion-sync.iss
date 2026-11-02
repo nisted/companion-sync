@@ -8,14 +8,18 @@
 #ifndef Build
   #define Build "dev"
 #endif
+#ifndef Version
+  #define Version "0.0.0"
+#endif
 #define AppName "Companion Sync"
 #define AppExe "Companion Sync.exe"
 
 [Setup]
 AppId={{6B0C3E52-6F7A-4C1B-9E43-2B1D5A7C9F10}
 AppName={#AppName}
-AppVersion=build {#Build}
-AppVerName={#AppName} build {#Build}
+AppVersion={#Version}
+AppVerName={#AppName} v{#Version} (build {#Build})
+VersionInfoVersion={#Version}
 AppPublisher=Nige Isted
 AppPublisherURL=https://github.com/nisted/companion-sync
 DefaultDirName={autopf}\{#AppName}
@@ -32,6 +36,15 @@ Compression=lzma2
 SolidCompression=yes
 CloseApplications=no
 RestartApplications=no
+
+[InstallDelete]
+; old copies moved aside by earlier updates (see CurStepChanged)
+Type: files; Name: "{app}\*.old-*"
+
+[UninstallDelete]
+; everything in the install folder (incl. old copies), and the app's own rclone copy
+Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{userappdata}\{#AppName}\bin"
 
 [Files]
 Source: "..\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -77,6 +90,20 @@ begin
     end;
   end;
   Sleep(1500);                             // let it finish closing and free its file
+end;
+
+// Move the old .exe aside before copying the new one. Windows allows renaming
+// a file that's still open, so nothing left running can block the update; the
+// old copy is deleted on the next install.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Exe: String;
+begin
+  if CurStep = ssInstall then begin
+    Exe := ExpandConstant('{app}\{#AppExe}');
+    if FileExists(Exe) then
+      RenameFile(Exe, Exe + '.old-' + GetDateTimeString('yyyymmddhhnnss', #0, #0));
+  end;
 end;
 
 function InitializeSetup(): Boolean;

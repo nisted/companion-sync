@@ -14,6 +14,8 @@ Tick things off by editing this file.
 - [x] Windows installer; one-click update (download, install, reopen) on Windows, Mac and Pi
 - [x] Companion-style tray: mini menu, pop-up window, web GUI (port 8090), Take config (build 21)
 - [x] Public repo (free)
+- [x] v1.1.0 (build 27): progress + Cancel, version numbers, lost-connection banner, pop-up off the taskbar,
+      unblockable Windows installer, rclone time limits
 - [x] "Get Companion" download page offered when a rig's Companion is too old
 - [x] Left-click on the tray icon opens the menu (Windows)
 - [x] Module sync: installed module versions (incl. custom imports) go to Drive on save/return and are copied onto a rig on take; `modules/modules.json` lists them

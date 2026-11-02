@@ -31,6 +31,19 @@ Like Companion's own tray app, in three steps:
   sign-in, Encryption, Settings, Log and Update. Settings has the port, network access and an optional password
   (off by default). Questions and sign-in windows still appear on the rig's own screen.
 
+## Versions
+
+From v1.1.0 (build 27) releases have a version number (major.minor.patch, in `VERSION`) as well as the build
+number: the app shows e.g. **v1.1.0 (build 27)**. Release tags stay `build-N`.
+
+## Progress and Cancel
+
+A take, save or return shows its steps and, while files move, a % bar with speed (read from rclone). It's in the
+pop-up, the web GUI, the tray tooltip and the Pi panel's SYNC tab. **Cancel** (pop-up and GUI) stops it: a
+cancelled take puts this rig's own config back and leaves the lock as it was; a cancelled save or return keeps
+the lock on this rig, so the next save sends everything again. Each rclone call gives up after
+`rclone_timeout_min` (default 20) minutes.
+
 ## Updating
 
 Choose **Update Companion Sync…** in the menu. It checks for a newer build, downloads it, installs it and

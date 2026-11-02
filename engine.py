@@ -31,6 +31,7 @@ config, and a rig with a newer Companion lets Companion upgrade the old one.
 This file is both the engine used by the desktop app and the command-line
 tool installed on the Pi.
 """
+import contextlib
 import datetime
 import json
 import os
@@ -41,6 +42,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -98,6 +100,8 @@ class Settings:
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
     rclone_timeout_min: float = 20     # give up on any one rclone call after this long (settings file)
+    progress: object = None            # Progress: what a take / save / return is doing (see Progress)
+    cancel: object = None              # threading.Event: set it to stop the running job
     state_file: str = ""               # last save / last problem, for the Pi panel
     storage_kind: str = "gdrive"       # which storage was chosen: see STORAGE_KINDS
     storage_file: str = ""             # where the choice is saved
@@ -215,6 +219,8 @@ def default_settings(**kw):
     s.github_token_file = os.path.join(home, ".companion-sync-github.json")
     s.key_file = os.path.join(home, ".companion-sync-key.json")
     s.settings_file = os.path.join(home, ".config", "companion-sync", "settings.json")
+    s.progress = Progress(os.path.join(home, ".companion-sync-progress.json"))
+    s.cancel = threading.Event()
     for k, v in kw.items():
         setattr(s, k, v)
     load_rig_settings(s)
@@ -335,27 +341,192 @@ def _owner(s):
 RCLONE_NET_FLAGS = ["--contimeout", "30s", "--timeout", "60s", "--low-level-retries", "5"]
 
 
-def run(cmd, check=True, input=None, timeout=None):
+class Cancelled(SyncError):
+    """The person pressed Cancel."""
+
+
+_RUNNING = set()                       # processes started by run(): ended by stop_all()
+_RUNNING_LOCK = threading.Lock()
+STATS_FLAGS = ["--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE"]
+_PCT = re.compile(r"(\d+)%")
+_SPEED = re.compile(r"([\d.]+\s*[KMGTP]?i?B/s)")
+_DONE = re.compile(r"([\d.]+\s*[KMGTP]?i?B)\s*/\s*([\d.]+\s*[KMGTP]?i?B)")
+
+
+def stop_all():
+    """End every command this process started (e.g. a stuck rclone) when the app closes."""
+    with _RUNNING_LOCK:
+        procs = list(_RUNNING)
+    for p in procs:
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def _cancelled(s):
+    return s is not None and s.cancel is not None and s.cancel.is_set()
+
+
+def run(cmd, check=True, input=None, timeout=None, s=None, transfer=False):
+    """Run a command. Ends it if Cancel is pressed (raises Cancelled) or it runs
+    past `timeout` seconds (raises Offline). transfer=True reads rclone's
+    one-line stats and reports them as progress."""
+    p = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                         creationflags=NO_WINDOW, encoding="utf-8", errors="replace")
+    with _RUNNING_LOCK:
+        _RUNNING.add(p)
+    out, err = [], []
+
+    def read_out():
+        out.append(p.stdout.read())
+
+    def read_err():
+        for line in p.stderr:
+            err.append(line)
+            if transfer and s is not None and s.progress is not None and "%" in line:
+                m = _PCT.search(line)
+                if m:
+                    sp, dn = _SPEED.search(line), _DONE.search(line)
+                    s.progress.transfer(int(m.group(1)), sp.group(1) if sp else "",
+                                        f"{dn.group(1)} of {dn.group(2)}" if dn else "")
+    readers = [threading.Thread(target=read_out, daemon=True), threading.Thread(target=read_err, daemon=True)]
+    for t in readers:
+        t.start()
+    if input is not None:
+        try:
+            p.stdin.write(input)
+            p.stdin.close()
+        except OSError:
+            pass
+    start = time.monotonic()
     try:
-        r = subprocess.run(cmd, text=True, capture_output=True, input=input, timeout=timeout,
-                           stdin=None if input is not None else subprocess.DEVNULL, creationflags=NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        mins = round(timeout / 60, 1)
-        raise Offline(f"{os.path.basename(cmd[0])} gave no answer for {mins:g} minutes, so it was stopped. "
-                      f"Is the connection working?")
+        while p.poll() is None:
+            if _cancelled(s):
+                p.kill()
+                p.wait()
+                raise Cancelled("Cancelled.")
+            if timeout and time.monotonic() - start > timeout:
+                p.kill()
+                p.wait()
+                mins = round(timeout / 60, 1)
+                raise Offline(f"{os.path.basename(cmd[0])} gave no answer for {mins:g} minutes, so it was "
+                              f"stopped. Is the connection working?")
+            time.sleep(0.2)
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(p)
+    for t in readers:
+        t.join(timeout=5)
+    r = subprocess.CompletedProcess(cmd, p.returncode, "".join(out), "".join(err))
     if check and r.returncode != 0:
-        raise SyncError(f"Command failed: {' '.join(cmd)}\n{r.stderr.strip()}")
+        raise SyncError(f"Command failed: {' '.join(cmd)}\n{r.stderr.strip()[-1500:]}")
     return r
 
 
-def rc(s, *args, check=True, input=None):
+def rc(s, *args, check=True, input=None, transfer=False):
     cmd = ([s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + RCLONE_NET_FLAGS
-           + list(s.rclone_flags) + list(args))
+           + (STATS_FLAGS if transfer else []) + list(s.rclone_flags) + list(args))
     try:
         limit = float(s.rclone_timeout_min) * 60
     except (TypeError, ValueError):
         limit = 20 * 60
-    return run(cmd, check=check, input=input, timeout=limit if limit > 0 else None)
+    return run(cmd, check=check, input=input, timeout=limit if limit > 0 else None, s=s, transfer=transfer)
+
+
+# ---- progress of a take / save / return -------------------------------------
+# Shown in the pop-up, the web GUI, the tray tooltip and the Pi panel. Also
+# written to a small file so another process (the panel, the timer) can show it.
+
+class Progress:
+    def __init__(self, path=""):
+        self.path = path
+        self.lock = threading.Lock()
+        self.state = {"active": False}
+        self._written = 0.0
+
+    def start(self, action):
+        with self.lock:
+            self.state = {"active": True, "action": action, "step": 0, "steps": 0, "text": "",
+                          "pct": None, "speed": "", "detail": "", "started": time.time(),
+                          "pid": os.getpid()}
+        self._write(force=True)
+
+    def step(self, i, n, text):
+        with self.lock:
+            self.state.update(step=i, steps=n, text=text, pct=None, speed="", detail="")
+        self._write(force=True)
+
+    def transfer(self, pct, speed, detail=""):
+        with self.lock:
+            self.state.update(pct=pct, speed=speed, detail=detail)
+        self._write()
+
+    def finish(self, result=""):
+        with self.lock:
+            self.state = {"active": False, "result": result, "ended": time.time()}
+        self._write(force=True)
+
+    def snapshot(self):
+        with self.lock:
+            st = dict(self.state)
+        if st.get("active"):
+            st["elapsed"] = int(time.time() - st.get("started", time.time()))
+        return st
+
+    def _write(self, force=False):
+        if not self.path or (not force and time.time() - self._written < 0.5):
+            return
+        self._written = time.time()
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.snapshot(), f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+def read_progress(path):
+    """Another process's progress file (Pi panel). {} if none or stale."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if st.get("active") and time.time() - st.get("started", 0) > 6 * 3600:
+        return {}                              # a job that died without finishing
+    return st
+
+
+def _step(s, i, n, text):
+    """Next step of the running job: logged, shown, and a place Cancel takes effect."""
+    if _cancelled(s):
+        raise Cancelled("Cancelled.")
+    s.log(text + "...")
+    if s.progress is not None:
+        s.progress.step(i, n, text)
+
+
+@contextlib.contextmanager
+def _job(s, action):
+    if s.cancel is not None:
+        s.cancel.clear()
+    if s.progress is not None:
+        s.progress.start(action)
+    result = "failed"
+    try:
+        yield
+        result = "done"
+    except Cancelled:
+        result = "cancelled"
+        raise
+    finally:
+        if s.cancel is not None:
+            s.cancel.clear()                   # Cancel only ever stops the job it was pressed for
+        if s.progress is not None:
+            s.progress.finish(result)
 
 
 # ---- local record of how syncing is going (shown on the Pi panel) ----------
@@ -455,17 +626,17 @@ class RcloneStorage:
         cmd = ["sync", local, self._p(rel), "--checksum", "--exclude", EXCLUDE]
         if backup_rel:
             cmd += ["--backup-dir", self._p(backup_rel)]
-        rc(self.s, *cmd)
+        rc(self.s, *cmd, transfer=True)
         rc(self.s, "check", local, self._p(rel), "--exclude", EXCLUDE)
 
     def pull_tree(self, rel, local):
-        rc(self.s, "copy", self._p(rel), local, "--exclude", EXCLUDE)
+        rc(self.s, "copy", self._p(rel), local, "--exclude", EXCLUDE, transfer=True)
 
     def copy_up(self, local, rel):
-        rc(self.s, "copy", local, self._p(rel))
+        rc(self.s, "copy", local, self._p(rel), transfer=True)
 
     def copy_down(self, rel, local):
-        rc(self.s, "copy", self._p(rel), local)
+        rc(self.s, "copy", self._p(rel), local, transfer=True)
 
     def purge(self, rel):
         rc(self.s, "purge", self._p(rel), check=False)
@@ -1598,6 +1769,23 @@ def install_config(s, version, src):
         shutil.copytree(src, target, dirs_exist_ok=True)
     tidy_safety_copies(s)
     s.log(f"Safety copy of the old config: {safety}")
+    return safety
+
+
+def restore_safety_copy(s, version, safety):
+    """Put a safety copy back as Companion's config for `version` (a cancelled take)."""
+    target = os.path.join(s.base, version)
+    if s.sudo_files:
+        run(["sudo", "rsync", "-a", "--delete", "--exclude", "backups/", f"{safety}/", f"{target}/"])
+        run(["sudo", "chown", "-R", _owner(s), target])
+    else:
+        for name in os.listdir(target):
+            if name == "backups":
+                continue
+            p = os.path.join(target, name)
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+        shutil.copytree(safety, target, dirs_exist_ok=True)
+    s.log(f"Cancelled: this rig's own config put back from {safety}")
 
 
 # ---- lock ------------------------------------------------------------------
@@ -1769,6 +1957,8 @@ def _modules_step(s, fn, verb):
         if added:
             s.log(f"Modules {verb}: {', '.join(added)}")
         return added
+    except Cancelled:
+        raise
     except SyncError as e:
         s.log(f"Modules not synced: {e}")
         return []
@@ -1797,6 +1987,11 @@ def status(s):
 
 
 def take(s, confirm_takeover=None, manage_companion=True):
+    with _job(s, "Take"):
+        return _take(s, confirm_takeover, manage_companion)
+
+
+def _take(s, confirm_takeover=None, manage_companion=True):
     """Lock the config to this rig and install the stored copy.
 
     confirm_takeover(message) -> bool is asked before taking over a stale
@@ -1804,6 +1999,8 @@ def take(s, confirm_takeover=None, manage_companion=True):
     manage_companion=False: Companion isn't running and mustn't be started
     (the Pi's boot check runs before Companion's service).
     """
+    N = 5
+    _step(s, 1, N, f"Checking who has the config in {s.place}")
     lv = local_version(s)
     m = moved_to(s)
     if m:
@@ -1833,21 +2030,29 @@ def take(s, confirm_takeover=None, manage_companion=True):
     store = data_store(s)                      # encrypted? needs the passphrase before anything stops
     if manage_companion:
         stop_companion(s)
+    safety = None
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dl = os.path.join(tmp, dv)
-            s.log(f"Downloading config from {s.place}...")
+            _step(s, 2, N, f"Downloading the config from {s.place}")
             store.pull_tree(dv, dl)
             if not os.path.exists(os.path.join(dl, "db.sqlite")):
                 raise SyncError(f"The config in {s.place} looks incomplete (no db.sqlite).")
-            install_config(s, dv, dl)
+            _step(s, 3, N, "Installing it in Companion's folder")
+            safety = install_config(s, dv, dl)
             if vkey(dv) < vkey(lv):
                 # This rig has a newer Companion. Move its own newer folder aside so
                 # Companion upgrades the downloaded config when it starts.
                 moved = _move_to_safety(s, lv, "upgrade")
                 s.log(f"Companion {vtext(lv)} will upgrade the {vtext(dv)} config when it starts. "
                       f"Old {lv} folder kept at {moved}")
+        _step(s, 4, N, "Copying modules this rig doesn't have")
         _modules_step(s, download_modules, "added to this rig")
+        _step(s, 5, N, f"Locking the config to {s.rig}")
+    except Cancelled:
+        if safety:                             # put this rig's own config back
+            restore_safety_copy(s, dv, safety)
+        raise
     finally:
         if manage_companion:
             start_companion(s)
@@ -1858,6 +2063,11 @@ def take(s, confirm_takeover=None, manage_companion=True):
 
 
 def save(s, quiet=False):
+    with _job(s, "Save"):
+        return _save(s, quiet)
+
+
+def _save(s, quiet=False):
     """Upload the current config and keep the lock.
 
     quiet=True is for the 15-minute timer: returns None without error if this
@@ -1880,8 +2090,12 @@ def save(s, quiet=False):
     if dv and vkey(lv) < vkey(dv):
         raise NeedsUpdate(f"This rig's Companion ({vtext(lv)}) is older than the config on "
                         f"{s.place} ({vtext(dv)}). Not saved.")
+    # A cancelled save keeps the lock here, so the next save sends everything again.
+    _step(s, 1, 3, f"Uploading the config to {s.place}")
     upload(s, lv)
+    _step(s, 2, 3, "Uploading new modules")
     _modules_step(s, upload_modules, "uploaded")
+    _step(s, 3, 3, "Refreshing the lock")
     write_lock(s, taken_time(h))
     mark_holding(s, True)
     record_ok(s, "save")
@@ -1890,6 +2104,11 @@ def save(s, quiet=False):
 
 
 def return_(s):
+    with _job(s, "Return"):
+        return _return(s)
+
+
+def _return(s):
     h = lock_holder(s)
     if holder_name(h) != s.rig:
         if was_holding(s):
@@ -1897,10 +2116,13 @@ def return_(s):
             mark_holding(s, False)
             return msg
         raise SyncError("This rig doesn't have the config, so there's nothing to return.")
-    s.log(f"Uploading config to {s.place}...")
+    # A cancelled return keeps the lock here (nothing half-sent is ever left unlocked).
     lv = local_version(s)
+    _step(s, 1, 3, f"Uploading the config to {s.place}")
     upload(s, lv)
+    _step(s, 2, 3, "Uploading new modules")
     _modules_step(s, upload_modules, "uploaded")
+    _step(s, 3, 3, "Unlocking it")
     s.store.delete("LOCK")
     mark_holding(s, False)
     record_ok(s, "return")

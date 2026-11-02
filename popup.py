@@ -69,6 +69,12 @@ def save_pos(x, y):
         pass
 
 
+def _mmss(sec):
+    if not isinstance(sec, (int, float)):
+        return ""
+    return f"{int(sec) // 60}:{int(sec) % 60:02d}"
+
+
 class Popup:
     def __init__(self, port, logo=None):
         self.base = f"http://127.0.0.1:{port}"
@@ -78,6 +84,14 @@ class Popup:
         r.title("Companion Sync")
         r.configure(bg=BG)
         r.resizable(False, False)
+        # No taskbar button while it's open, like Companion's launcher window.
+        try:
+            if sys.platform == "win32":
+                r.attributes("-toolwindow", True)
+            elif sys.platform.startswith("linux"):
+                r.attributes("-type", "utility")
+        except tk.TclError:
+            pass
         r.protocol("WM_DELETE_WINDOW", lambda: self.post("/api/popup/hide"))
         r.withdraw()
         self.win_icon = None                 # the CS logo on the taskbar button, not Tk's quill
@@ -125,7 +139,21 @@ class Popup:
         self.detail = tk.Label(tt, text="", bg=BG, fg=DIM, font=(FONT, z(9)), anchor="w",
                                justify="left", wraplength=W - z(100))
         self.detail.pack(anchor="w")
-        self.box_parts = [self.box, inner, self.dot, tt, self.line, self.detail]
+        # Progress of a take / save / return: bar, step and speed, Cancel.
+        self.prog = tk.Frame(self.box, bg=BG)
+        self.bar = tk.Canvas(self.prog, height=z(10), highlightthickness=0, bg=BG)
+        self.bar.pack(fill="x", padx=z(12), pady=(0, z(6)))
+        prow = tk.Frame(self.prog, bg=BG)
+        prow.pack(fill="x", padx=z(12), pady=(0, z(10)))
+        self.ptext = tk.Label(prow, text="", bg=BG, fg=DIM, font=(FONT, z(9)), anchor="w")
+        self.ptext.pack(side="left")
+        self.cancel = tk.Label(prow, text="Cancel", bg=BTN, fg=TEXT, font=(FONT, z(9)), padx=z(10),
+                               pady=z(2), highlightthickness=1, highlightbackground=PURPLE2, cursor="hand2")
+        self.cancel.pack(side="right")
+        self.cancel.bind("<Button-1>", lambda e: self.post("/api/do/cancel"))
+        self.prog_shown = False
+        self.box_parts = [self.box, inner, self.dot, tt, self.line, self.detail, self.prog, prow,
+                          self.ptext, self.bar]
 
         rows = tk.Frame(r, bg=BG)
         rows.pack(fill="x", padx=z(20))
@@ -273,7 +301,8 @@ class Popup:
         self.dot.create_oval(1, 1, z(14) - 1, z(14) - 1, fill=border, outline=border)
         self.line.configure(text=st.get("line", ""))
         self.detail.configure(text=st.get("detail", ""), fg=subcol)
-        self.sub.configure(text=f"{st.get('rig', '')} · build {st.get('build', '')}")
+        self.sub.configure(text=f"{st.get('rig', '')} · {st.get('label') or 'build ' + str(st.get('build', ''))}")
+        self.show_progress(st.get("progress") or {}, border, fill)
         self.vals["last_save"].configure(text=st.get("last_save") or "never")
         self.vals["place"].configure(text=st.get("place") or "—")
         si = st.get("signed_in")
@@ -286,6 +315,31 @@ class Popup:
         self.set_enabled("take", not st.get("mine"))
         self.chk.configure(text="✓" if st.get("start_at_login") else " ",
                            bg=PURPLE if st.get("start_at_login") else BTN)
+
+    def show_progress(self, pr, colour, fill):
+        if not pr.get("active"):
+            if self.prog_shown:
+                self.prog.pack_forget()
+                self.prog_shown = False
+            return
+        if not self.prog_shown:
+            self.prog.pack(fill="x")
+            self.prog_shown = True
+        self.bar.configure(bg=fill)
+        self.bar.update_idletasks()
+        w, h = max(self.bar.winfo_width(), 10), z(10)
+        self.bar.delete("all")
+        self.bar.create_rectangle(0, 0, w, h, fill="#0c0a12", outline="")
+        pct = pr.get("pct")
+        if pct is not None:
+            self.bar.create_rectangle(0, 0, int(w * min(pct, 100) / 100), h, fill=PURPLE2, outline="")
+        elif pr.get("steps"):                  # no % yet: show how far through the steps
+            self.bar.create_rectangle(0, 0, int(w * (pr["step"] - 1) / pr["steps"]), h, fill=PURPLE, outline="")
+        step = f"{pr.get('step')}/{pr.get('steps')} " if pr.get("steps") else ""
+        extra = " · ".join(x for x in (f"{pct}%" if pct is not None else "", pr.get("speed", ""),
+                                        _mmss(pr.get("elapsed"))) if x)
+        self.ptext.configure(text=f"{pr.get('action', '')} {step}· {pr.get('text', '')}"
+                                  + (f"\n{extra}" if extra else ""), justify="left", wraplength=W - z(140))
 
     def run(self):
         self.root.after(200, self.poll)

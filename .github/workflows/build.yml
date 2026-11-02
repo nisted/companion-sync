@@ -36,7 +36,8 @@ jobs:
           python -c "from PIL import Image; Image.open('icon.png').save('icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(256,256)])"
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
-          & $iscc "/DBuild=${{ github.run_number }}" build\companion-sync.iss
+          $ver = (Get-Content VERSION).Trim()
+          & $iscc "/DBuild=${{ github.run_number }}" "/DVersion=$ver" build\companion-sync.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
@@ -71,6 +72,8 @@ jobs:
             --hidden-import pystray._darwin --hidden-import web --hidden-import popup --add-binary "rclone:." --add-data "logo-source.png:." app.py
           # menu-bar only: no Dock icon
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(cat VERSION)" "dist/Companion Sync.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "dist/Companion Sync.app/Contents/Info.plist"
           codesign --force --deep -s - "dist/Companion Sync.app"
           ditto -c -k --keepParent "dist/Companion Sync.app" Companion-Sync-Mac.zip
       - uses: actions/upload-artifact@v4
@@ -90,7 +93,7 @@ jobs:
       - name: Package for the Pi
         run: |
           mkdir -p pkg/companion-sync
-          cp -r engine.py app.py web.py popup.py icon.py logo-source.png _client.py panel pi pkg/companion-sync/
+          cp -r engine.py app.py web.py popup.py icon.py logo-source.png _client.py VERSION panel pi pkg/companion-sync/
           echo "${{ github.run_number }}" > pkg/companion-sync/BUILD
           find pkg -name __pycache__ -prune -exec rm -rf {} +
           tar czf Companion-Sync-Pi.tar.gz -C pkg companion-sync
@@ -108,6 +111,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: out
@@ -122,5 +126,5 @@ jobs:
           gh release create "build-${{ github.run_number }}" \
             Companion-Sync-Setup.exe Companion-Sync-Windows.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
             --repo "${{ github.repository }}" --latest \
-            --title "Companion Sync build ${{ github.run_number }}" \
+            --title "Companion Sync v$(cat VERSION) (build ${{ github.run_number }})" \
             --notes "Built from ${{ github.sha }}"

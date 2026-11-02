@@ -125,6 +125,21 @@ def build_number():
     return "dev"
 
 
+def version_label():
+    """'v1.1.0 (build 27)', or 'build 27' for a package without a VERSION file."""
+    b = build_number()
+    for p in (os.path.join(os.path.dirname(HERE), "VERSION"), os.path.join(HERE, "VERSION")):
+        try:
+            with open(p) as f:
+                return f"v{f.read().strip()} (build {b})"
+        except OSError:
+            continue
+    return f"build {b}"
+
+
+PROGRESS_FILE = os.path.expanduser("~/.companion-sync-progress.json")
+
+
 class Panel:
     def __init__(self, cfg, hw, settings=None, live=True):
         self.cfg, self.hw, self.live = cfg, hw, live
@@ -414,9 +429,9 @@ class Panel:
         else:
             drive = (None, None)
         self.readout(d, 60, "DRIVE", *drive)
-        self.readout(d, 76, "COMPANION SYNC", f"build {self.build}")
+        self.readout(d, 76, "COMPANION SYNC", version_label().upper())
         problem = self.sync_problem()
-        if problem:
+        if not self.draw_progress(d, 88) and problem:
             d.text((160, 96), problem, font=Fonts.btn, fill=C["red"], anchor="mm")
         bw, bh, gap = 96, 34, 6
         for i, (bid, label, style) in enumerate((("take", "TAKE", "purple"), ("save", "SAVE NOW", "cyan"),
@@ -425,6 +440,24 @@ class Panel:
             x = 10 + (i % 3) * (bw + gap)
             y = 108 + (i // 3) * (bh + gap)
             self.button(d, (x, y, x + bw, y + bh), bid, label, style)
+
+    def draw_progress(self, d, y, x0=10, x1=W - 10):
+        """A take / save / return running here or in the tray app or timer:
+        a bar with step and %. True if one is running."""
+        pr = E.read_progress(PROGRESS_FILE)
+        if not pr.get("active"):
+            return False
+        C = self.C
+        pct = pr.get("pct")
+        steps = pr.get("steps") or 0
+        frac = pct / 100 if pct is not None else ((pr.get("step", 1) - 1) / steps if steps else 0)
+        label = f"{pr.get('action', '').upper()} {pr.get('step', '')}/{steps}" if steps else pr.get("action", "").upper()
+        d.text((x0, y), label, font=Fonts.mono, fill=C["cyan"])
+        if pct is not None:
+            d.text((x1, y), f"{pct}%", font=Fonts.mono, fill=C["cyan"], anchor="ra")
+        d.rectangle((x0, y + 12, x1, y + 17), fill=hexrgb("#0e0618"), outline=C["purple_dim"])
+        d.rectangle((x0, y + 12, x0 + int((x1 - x0) * max(0, min(frac, 1))), y + 17), fill=C["purple"])
+        return True
 
     def draw_overlay(self, d):
         C, o = self.C, self.overlay
@@ -435,6 +468,8 @@ class Panel:
             title += "." * (int(time.time() * 2) % 4)
         d.text((18, 32), title, font=Fonts.head, fill=C["lavender"])
         d.line((18, 48, W - 18, 48), fill=C["purple_dim"])
+        if o["kind"] == "busy":
+            self.draw_progress(d, box[3] - 30, 18, W - 18)
         f = Fonts.small if o.get("small") else Fonts.msg
         y = 54
         for line in o.get("lines", []):
@@ -726,7 +761,7 @@ class Panel:
             rel = json.loads(r.read().decode())
         new = rel.get("tag_name", "").replace("build-", "")
         if new == self.build:
-            self.message("UP TO DATE", f"BD-1 already has build {self.build}.", colour=self.C["green"])
+            self.message("UP TO DATE", f"BD-1 already has {version_label()}.", colour=self.C["green"])
             return
         asset = next((a for a in rel.get("assets", []) if a.get("name") == self.cfg["pi_asset"]), None)
         if not asset:

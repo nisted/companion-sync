@@ -10,4 +10,6 @@ with open("_client.py", "w") as f:
     f.write(f"CLIENT_ID = {cid!r}\n")
     f.write(f"CLIENT_SECRET = {secret!r}\n")
     f.write(f"BUILD = {os.environ.get('GITHUB_RUN_NUMBER', 'dev')!r}\n")
+    with open("VERSION") as v:
+        f.write(f"VERSION = {v.read().strip()!r}\n")
 print("Google sign-in details added.")

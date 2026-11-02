@@ -519,7 +519,49 @@ def t_linux_companion_modes(w):
             os.environ["HOME"] = old[2]
 
 
-SCENARIOS = [t_linux_companion_modes, t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
+def t_progress_steps(w):
+    """A take reports its steps (and, through rclone, a %) and finishes."""
+    import threading
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="bravo's own")
+    seen = []
+
+    class Rec(E.Progress):
+        def step(self, i, n, text):
+            seen.append((i, n, text))
+            super().step(i, n, text)
+    b.progress = Rec(os.path.join(w.tmp, "progress.json"))
+    b.cancel = threading.Event()
+    E.take(b)
+    assert [x[0] for x in seen] == [1, 2, 3, 4, 5], seen
+    st = E.read_progress(os.path.join(w.tmp, "progress.json"))
+    assert st.get("active") is False and st.get("result") == "done", st
+
+
+def t_cancel_take_restores(w):
+    """Cancel after the config was installed: this rig's own config is put back, no lock."""
+    import threading
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="bravo's own")
+    b.cancel = threading.Event()
+
+    class CancelAt4(E.Progress):
+        def step(self, i, n, text):
+            super().step(i, n, text)
+            if i == 4:
+                b.cancel.set()                 # pressed Cancel while modules are copying
+    b.progress = CancelAt4()
+    expect_error(lambda: E.take(b), "cancelled", E.Cancelled)
+    assert read_value(b.base) == "bravo's own", "own config put back"
+    assert E.lock_holder(b) is None, "not locked"
+    assert b.progress.snapshot().get("result") == "cancelled"
+
+
+SCENARIOS = [t_progress_steps, t_cancel_take_restores, t_linux_companion_modes, t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]

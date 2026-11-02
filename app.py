@@ -67,6 +67,15 @@ except ImportError:
     CLIENT_ID = os.environ.get("CS_CLIENT_ID", "")
     CLIENT_SECRET = os.environ.get("CS_CLIENT_SECRET", "")
     BUILD = "dev"
+try:
+    from _client import VERSION
+except ImportError:
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")) as _v:
+            VERSION = _v.read().strip()
+    except OSError:
+        VERSION = "dev"
+LABEL = f"v{VERSION} (build {BUILD})"       # what the pop-up, GUI and menu show
 
 LINUX = not E.WIN and not E.MAC
 RELEASES = "https://github.com/nisted/companion-sync/releases/latest"
@@ -128,6 +137,24 @@ def bundled(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     p = os.path.join(base, name)
     return p if os.path.exists(p) else None
+
+
+def rclone_outside_temp(src):
+    """The one-file Windows app unpacks rclone into a temp folder that's deleted
+    when the app closes, and a running rclone stops that. So run a copy kept in
+    the app's own folder, refreshed when the bundled one changes."""
+    if not src or not getattr(sys, "frozen", False) or not E.WIN:
+        return src
+    dst = os.path.join(data_dir(), "bin", os.path.basename(src))
+    try:
+        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst + ".new")
+            os.replace(dst + ".new", dst)
+        return dst
+    except OSError:
+        log.exception("couldn't copy rclone out of the temp folder")
+        return src
 
 
 def fetch(url, dest=None):
@@ -473,7 +500,7 @@ def make_icon(state):
 class App:
     def __init__(self):
         self.s = E.default_settings(log=log.info)
-        rclone = bundled("rclone.exe" if E.WIN else "rclone")
+        rclone = rclone_outside_temp(bundled("rclone.exe" if E.WIN else "rclone"))
         if rclone:
             self.s.rclone = rclone
         self.state = "busy"
@@ -702,17 +729,20 @@ class App:
             lv = None
         where = (self.s.folder_path if self.s.storage == "folder" else
                  self.s.github_repo if self.s.storage == "github" else f"{self.s.place}: {self.s.folder}")
+        pr = self.s.progress.snapshot() if self.s.progress else {}
+        line = {"Take": "Taking the config…", "Save": "Saving…", "Return": "Returning the config…"}.get(
+            pr.get("action"), self.line) if pr.get("active") else self.line
         return {
-            "state": self.state, "line": self.line, "detail": detail, "mine": self.mine,
+            "state": self.state, "line": line, "detail": detail, "mine": self.mine,
             "holder": st.get("holder"), "age_hours": st.get("age_hours"), "rig": self.s.rig,
-            "build": BUILD, "platform": self.s.platform,
+            "build": BUILD, "version": VERSION, "label": LABEL, "platform": self.s.platform,
             "place": self.s.place.removeprefix("the ")[:1].upper() + self.s.place.removeprefix("the ")[1:], "storage_where": where,
             "signed_in": self.signed, "encrypted": self.encrypted, "last_save": last,
             "companion_running": running, "local_version": lv,
             "drive_version": E.vtext(st["drive_version"]) if st.get("drive_version") else None,
             "companion_desc": E.describe_companion(self.s), "start_at_login": login_enabled(),
             "popup_visible": self.popup_visible, "busy": self.work.locked(), "gui_url": self.gui_url(),
-            "quitting": self.quitting,
+            "quitting": self.quitting, "progress": self.s.progress.snapshot() if self.s.progress else {},
         }
 
     def save_every(self):
@@ -722,7 +752,7 @@ class App:
             return SAVE_EVERY
 
     WEB_ACTIONS = ("open", "take", "save", "return", "storage", "sign_in", "encryption", "update",
-                   "get_companion", "gui", "toggle_login", "status")
+                   "get_companion", "gui", "toggle_login", "status", "cancel")
 
     def web_action(self, name):
         """A button in the pop-up or the web GUI. Long jobs run in the background;
@@ -735,6 +765,11 @@ class App:
         if name == "toggle_login":
             set_login(not login_enabled())
             return True, "Start at login is " + ("on." if login_enabled() else "off.")
+        if name == "cancel":
+            if self.s.progress and self.s.progress.snapshot().get("active"):
+                self.s.cancel.set()
+                return True, "Cancelling…"
+            return False, "Nothing to cancel."
         if name == "get_companion":
             webbrowser.open(E.COMPANION_DOWNLOAD)
             return True, "The Companion download page opened on this rig."
@@ -753,13 +788,15 @@ class App:
         if not self.latest or time.time() - self.latest[0] > 600:
             try:
                 rel = json.loads(fetch(LATEST_API))
-                self.latest = (time.time(), rel.get("tag_name", "").removeprefix("build-"))
+                name = (rel.get("name") or "").removeprefix("Companion Sync ").strip()
+                self.latest = (time.time(), rel.get("tag_name", "").removeprefix("build-"), name)
             except Exception:
-                self.latest = (time.time() - 540, None)       # try again in a minute
+                self.latest = (time.time() - 540, None, None)  # try again in a minute
         new = self.latest[1]
         newer = bool(new and new.isdigit() and (BUILD == "dev" or not str(BUILD).isdigit()
                                                 or int(new) > int(BUILD)))
-        return {"current": BUILD, "latest": new, "newer": newer}
+        label = self.latest[2] if self.latest[2] and "(" in self.latest[2] else (f"build {new}" if new else None)
+        return {"current": LABEL, "latest": label, "latest_build": new, "newer": newer}
 
     def log_tail(self, n):
         try:
@@ -1008,15 +1045,12 @@ class App:
             raise E.SyncError(f"Can't reach GitHub to check for an update. Are you online?\n{e}")
         new = rel.get("tag_name", "").removeprefix("build-")
         if BUILD != "dev" and new.isdigit() and str(BUILD).isdigit() and int(new) <= int(BUILD):
-            tell(f"You have the latest build ({BUILD}).")
+            tell(f"You have the latest version, {LABEL}.")
             return
         asset = next((a for a in rel.get("assets", []) if a.get("name") == UPDATE_ASSET), None)
         if not asset:
             tell(f"Build {new} has no {UPDATE_ASSET}. Your browser will open the download page.")
             webbrowser.open(RELEASES)
-            return
-        if not ask(f"Update {APP} from build {BUILD} to build {new}?\n\n"
-                   f"{APP} closes for a moment and opens again. Companion keeps running."):
             return
         self.set_state("busy", f"Downloading build {new}…")
         tmp = tempfile.mkdtemp(prefix="companion-sync-update-")
@@ -1038,6 +1072,7 @@ class App:
         # The installer waits for this app and the pop-up to close, installs, then
         # opens it again. Close the pop-up first: it's a copy of the same .exe.
         self.popup_stop()
+        E.stop_all()
         subprocess.Popen([setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
                          env=child_env(), close_fds=True,
                          creationflags=0x00000008 | 0x00000200)   # detached, own process group
@@ -1219,6 +1254,7 @@ class App:
 
     def quit(self):
         self.popup_stop()
+        E.stop_all()                                # a stuck rclone mustn't outlive the app
         self.icon.stop()
 
     # -- background loop: watch Companion, save every 15 minutes --
@@ -1281,6 +1317,28 @@ class App:
         except OSError as e:
             log.info("web GUI didn't start on port %s: %s", self.gui_port(), e)
         self.popup_start()                          # hidden until the icon is clicked
+
+        def progress_ticker():
+            """Tray tooltip follows a running take / save / return."""
+            was = False
+            while True:
+                pr = self.s.progress.snapshot() if self.s.progress else {}
+                if pr.get("active"):
+                    pct = f" · {pr['pct']}%" if pr.get("pct") is not None else ""
+                    step = f" {pr['step']}/{pr['steps']}" if pr.get("steps") else ""
+                    try:
+                        self.icon.title = f"{APP}: {pr.get('action')}{step}{pct}"[:127]
+                    except Exception:
+                        pass
+                    was = True
+                elif was:
+                    was = False
+                    try:
+                        self.icon.title = f"{APP}: {self.line}"
+                    except Exception:
+                        pass
+                time.sleep(1)
+        threading.Thread(target=progress_ticker, daemon=True).start()
 
         def setup(icon):
             icon.visible = True
