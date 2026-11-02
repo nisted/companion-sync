@@ -67,6 +67,21 @@ class Popup:
         self.last_pos = (x, y)
         r.bind("<Configure>", self.moved)
         r.withdraw()
+        self.win_icon = None                 # the CS logo on the taskbar button, not Tk's quill
+        if logo:
+            try:
+                from PIL import Image, ImageTk
+                self.win_icon = ImageTk.PhotoImage(Image.open(logo).convert("RGBA").resize((64, 64)))
+            except Exception:
+                try:
+                    self.win_icon = tk.PhotoImage(file=logo)
+                except Exception:
+                    pass
+            if self.win_icon:
+                try:
+                    r.iconphoto(True, self.win_icon)
+                except Exception:
+                    pass
 
         head = tk.Frame(r, bg=BG)
         head.pack(fill="x", padx=20, pady=(18, 10))
