@@ -43,7 +43,7 @@ DEFAULTS = {
     "confirm_s": 4, "flash_s": 0.5, "frame_s": 0.25,
     "boot_screen_max_s": 150, "temp_warn_c": 75,
     "sys_check_s": 2, "net_check_s": 15, "companion_check_s": 5,
-    "sync_check_s": 120, "latest_check_h": 6,
+    "sync_check_s": 120, "latest_check_h": 6, "latest_retry_min": 5,
     # look
     "logo": "startup-logo.png",
     "colours": {
@@ -187,18 +187,30 @@ class Panel:
             self.data["boot"] = info.boot_report(c["boot_report"])
 
         def latest():
-            v = info.latest_stable(c)
-            if v:
-                self.data["latest"] = v
+            # Until Bitfocus answers (the panel often starts before the network),
+            # try again every few minutes; after that, every latest_check_h hours.
+            while not self.stopping:
+                try:
+                    v = info.latest_stable(c)
+                except Exception:
+                    log.exception("latest Companion version check failed")
+                    v = None
+                if v:
+                    self.data["latest"] = v
+                    time.sleep(c["latest_check_h"] * 3600)
+                else:
+                    log.info("latest Companion version: no answer from Bitfocus (this Pi: %s); "
+                             "trying again in %s min", os.uname().machine, c["latest_retry_min"])
+                    time.sleep(c["latest_retry_min"] * 60)
 
         def sync():
             self.data["sync"] = info.sync(E, self.fast_settings())
 
         for fn, every, ev in ((sys_, c["sys_check_s"], None), (net, c["net_check_s"], None),
                               (comp, c["companion_check_s"], None),
-                              (latest, c["latest_check_h"] * 3600, None),
                               (sync, c["sync_check_s"], self.sync_now)):
             threading.Thread(target=loop, args=(fn, every, ev), daemon=True).start()
+        threading.Thread(target=latest, daemon=True).start()
 
     def fast_settings(self):
         """Engine settings that give up quickly when Drive can't be reached."""

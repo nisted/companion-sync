@@ -27,6 +27,7 @@
   "companion_check_s": 5,
   "sync_check_s": 120,
   "latest_check_h": 6,
+  "latest_retry_min": 5,
   "logo": "startup-logo.png",
   "colours": {
     "bg": "#06080c",
