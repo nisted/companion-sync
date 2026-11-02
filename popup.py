@@ -26,6 +26,27 @@ W, H = 380, 470
 FONT = "Segoe UI" if sys.platform == "win32" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
 
 
+POS_FILE = os.path.expanduser("~/.config/companion-sync/popup-position.json")
+
+
+def load_pos():
+    try:
+        with open(POS_FILE) as f:
+            d = json.load(f)
+        return int(d["x"]), int(d["y"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_pos(x, y):
+    try:
+        os.makedirs(os.path.dirname(POS_FILE), exist_ok=True)
+        with open(POS_FILE, "w") as f:
+            json.dump({"x": x, "y": y}, f)
+    except OSError:
+        pass
+
+
 class Popup:
     def __init__(self, port, logo=None):
         self.base = f"http://127.0.0.1:{port}"
@@ -36,9 +57,15 @@ class Popup:
         r.configure(bg=BG)
         r.resizable(False, False)
         r.protocol("WM_DELETE_WINDOW", lambda: self.post("/api/popup/hide"))
+        # Centred the first time, then wherever it was last left.
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        y = sh - H - 90 if sys.platform == "win32" else 40      # by the clock: bottom right / top right
-        r.geometry(f"{W}x{H}+{sw - W - 20}+{y}")
+        x, y = (sw - W) // 2, (sh - H) // 2
+        pos = load_pos()
+        if pos and -W // 2 < pos[0] < sw - 40 and 0 <= pos[1] < sh - 40:
+            x, y = pos
+        r.geometry(f"{W}x{H}+{x}+{y}")
+        self.last_pos = (x, y)
+        r.bind("<Configure>", self.moved)
         r.withdraw()
 
         head = tk.Frame(r, bg=BG)
@@ -110,6 +137,16 @@ class Popup:
         lab.pack(side="left", padx=8)
         for w in (self.chk, lab):
             w.bind("<Button-1>", lambda e: self.post("/api/do/toggle_login"))
+
+    def moved(self, event):
+        if event.widget is not self.root or not self.visible:
+            return
+        pos = (self.root.winfo_x(), self.root.winfo_y())
+        if pos != self.last_pos:
+            self.last_pos = pos
+            if getattr(self, "_save_job", None):
+                self.root.after_cancel(self._save_job)
+            self._save_job = self.root.after(800, lambda: save_pos(*self.last_pos))
 
     def button(self, parent, text, key, primary):
         # Labels, not tk.Buttons: the Mac ignores tk.Button colours.

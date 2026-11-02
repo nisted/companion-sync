@@ -355,8 +355,49 @@ def linux_autostart_entry():
 
 
 def _mac_app_path():
-    # .../Companion Sync.app/Contents/MacOS/Companion Sync  ->  .../Companion Sync.app
-    return os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+    """Where the app really is. .../Companion Sync.app/Contents/MacOS/Companion Sync
+    -> .../Companion Sync.app. A downloaded app that still has the 'from the
+    internet' flag is run by macOS from a hidden read-only copy (App
+    Translocation); then this is the real one, e.g. in Applications."""
+    here = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+    if "/AppTranslocation/" not in here:
+        return here
+    return _mac_untranslocated(here) or here
+
+
+def _mac_untranslocated(path):
+    """The original location of a translocated app (macOS Security framework), or
+    failing that a copy in Applications. None if it can't be found."""
+    try:
+        import ctypes
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        sec = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Security.framework/Security")
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                               ctypes.c_long, ctypes.c_bool]
+        cf.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+        cf.CFURLGetFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                                        ctypes.c_char_p, ctypes.c_long]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        sec.SecTranslocateCreateOriginalPathForURL.restype = ctypes.c_void_p
+        sec.SecTranslocateCreateOriginalPathForURL.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        raw = path.encode()
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), True)
+        orig = sec.SecTranslocateCreateOriginalPathForURL(url, None) if url else None
+        if url:
+            cf.CFRelease(url)
+        if orig:
+            buf = ctypes.create_string_buffer(4096)
+            ok = cf.CFURLGetFileSystemRepresentation(orig, True, buf, 4096)
+            cf.CFRelease(orig)
+            if ok and buf.value:
+                return buf.value.decode().rstrip("/")
+    except Exception:
+        log.exception("couldn't find the app's real location")
+    for p in (f"/Applications/{APP}.app", os.path.expanduser(f"~/Applications/{APP}.app")):
+        if os.path.isdir(p):
+            return p
+    return None
 
 
 def login_enabled():
@@ -974,8 +1015,15 @@ class App:
 
     def _update_mac(self, zip_path, tmp):
         app = _mac_app_path()
+        if "/AppTranslocation/" in app:
+            raise E.SyncError(
+                f"macOS is running {APP} from a hidden copy, so it can't update itself.\n\n"
+                f"Quit {APP}, then in Terminal run:\n"
+                f"  xattr -dr com.apple.quarantine \"/Applications/{APP}.app\"\n"
+                f"(or wherever the app is), open it again and update.")
         if not app.endswith(".app") or not os.access(os.path.dirname(app), os.W_OK):
-            raise E.SyncError(f"Can't replace {app}.\nMove {APP} into Applications, then try again.")
+            raise E.SyncError(f"Can't replace {app}: that folder can't be written to.\n"
+                              f"Move {APP} into Applications, then try again.")
         unpacked = os.path.join(tmp, "new")
         r = subprocess.run(["ditto", "-x", "-k", zip_path, unpacked], capture_output=True, text=True)
         new_app = os.path.join(unpacked, f"{APP}.app")
