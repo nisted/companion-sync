@@ -490,6 +490,7 @@ class App:
         self.encrypted = None
         self.popup_visible = False
         self.popup_proc = None
+        self.quitting = False
         self.httpd = None
         self.latest = None            # (time checked, latest build) for the GUI's Update page
         # On the Pi, a systemd timer may already save every 15 minutes (headless
@@ -637,10 +638,25 @@ class App:
 
     def popup_restart(self):
         """Start a fresh pop-up (e.g. its size changed), keeping it shown or hidden."""
-        if self.popup_proc and self.popup_proc.poll() is None:
-            self.popup_proc.terminate()
+        self._popup_kill(self.popup_proc)
         self.popup_proc = None
         self.popup_start()
+
+    @staticmethod
+    def _popup_kill(p):
+        """End the pop-up process. On Windows the one-file .exe runs as two
+        processes, so end the whole tree."""
+        if not p or p.poll() is not None:
+            return
+        if E.WIN:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True,
+                           creationflags=0x08000000)
+        else:
+            p.terminate()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
 
     def popup_set(self, show):
         self.popup_visible = bool(show)
@@ -696,6 +712,7 @@ class App:
             "drive_version": E.vtext(st["drive_version"]) if st.get("drive_version") else None,
             "companion_desc": E.describe_companion(self.s), "start_at_login": login_enabled(),
             "popup_visible": self.popup_visible, "busy": self.work.locked(), "gui_url": self.gui_url(),
+            "quitting": self.quitting,
         }
 
     def save_every(self):
@@ -1018,7 +1035,9 @@ class App:
             self._update_pi(dest, tmp, new)
 
     def _update_windows(self, setup):
-        # The installer waits for this app to close, installs, then opens it again.
+        # The installer waits for this app and the pop-up to close, installs, then
+        # opens it again. Close the pop-up first: it's a copy of the same .exe.
+        self.popup_stop()
         subprocess.Popen([setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
                          env=child_env(), close_fds=True,
                          creationflags=0x00000008 | 0x00000200)   # detached, own process group
@@ -1187,9 +1206,19 @@ class App:
         else:
             subprocess.run(["xdg-open" if LINUX else "open", p])
 
+    def popup_stop(self):
+        """Close the pop-up and wait (briefly) until it has gone."""
+        self.quitting = True                       # it reads this and closes itself
+        p = self.popup_proc
+        if not p or p.poll() is not None:
+            return
+        try:
+            p.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            self._popup_kill(p)
+
     def quit(self):
-        if self.popup_proc and self.popup_proc.poll() is None:
-            self.popup_proc.terminate()
+        self.popup_stop()
         self.icon.stop()
 
     # -- background loop: watch Companion, save every 15 minutes --

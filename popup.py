@@ -213,7 +213,7 @@ class Popup:
 
     # -- talking to the tray app --
     def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=3) as r:
+        with urllib.request.urlopen(self.base + path, timeout=1.5) as r:
             return json.loads(r.read().decode())
 
     def post(self, path):
@@ -231,8 +231,11 @@ class Popup:
             self.misses = 0
         except Exception:
             self.misses += 1
-            if self.misses > 5:               # the tray app has gone
+            if self.misses > 2:               # the tray app has gone
                 self.root.destroy()
+            return
+        if st.get("quitting"):                # the app is closing (e.g. for an update)
+            self.root.destroy()
             return
         self.show(st)
 
@@ -280,6 +283,12 @@ class Popup:
 
 
 def main(port, logo=None):
+    if sys.platform == "win32":
+        # Same name as the tray app's: the installer waits until neither is open,
+        # as this window is a copy of the same .exe and keeps it locked.
+        import ctypes
+        global _mutex
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "CompanionSyncRunning")
     Popup(port, logo).run()
 
 
