@@ -72,8 +72,11 @@ jobs:
             --hidden-import pystray._darwin --hidden-import web --hidden-import popup --add-binary "rclone:." --add-data "logo-source.png:." app.py
           # menu-bar only: no Dock icon
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(cat VERSION)" "dist/Companion Sync.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "dist/Companion Sync.app/Contents/Info.plist"
+          plist="dist/Companion Sync.app/Contents/Info.plist"
+          for kv in "CFBundleShortVersionString $(cat VERSION)" "CFBundleVersion ${{ github.run_number }}"; do
+            set -- $kv
+            /usr/libexec/PlistBuddy -c "Set :$1 $2" "$plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$plist"
+          done
           codesign --force --deep -s - "dist/Companion Sync.app"
           ditto -c -k --keepParent "dist/Companion Sync.app" Companion-Sync-Mac.zip
       - uses: actions/upload-artifact@v4
