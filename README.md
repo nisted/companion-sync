@@ -18,6 +18,19 @@ From the [latest release](https://github.com/nisted/companion-sync/releases/late
 | `Companion-Sync-Mac.zip` | Mac (Apple silicon): a menu-bar app |
 | `Companion-Sync-Pi.tar.gz` | Raspberry Pi: a tray app on a Pi with a desktop, or headless (command and services) |
 
+## Using it
+
+Like Companion's own tray app, in three steps:
+
+- **Tray icon:** a left click shows or hides the **pop-up window** (Windows and Mac; on the Pi a click opens the
+  menu, unless `tray_left_click` is turned on in Settings). A right click opens the mini menu: Show/Hide window,
+  Open Companion, Take config, Launch GUI, Quit.
+- **Pop-up window:** who has the config, last save, storage, sign-in and encryption, with Open Companion, Take
+  config, Save now, Return config, Launch GUI and Start at login.
+- **Web GUI** (Launch GUI, or `http://<this rig>:8090` from any device on the network): Status, Storage &
+  sign-in, Encryption, Settings, Log and Update. Settings has the port, network access and an optional password
+  (off by default). Questions and sign-in windows still appear on the rig's own screen.
+
 ## Updating
 
 Choose **Update Companion Sync…** in the menu. It checks for a newer build, downloads it, installs it and
@@ -72,6 +85,7 @@ Pi commands: `companion-sync status | take | save | return | setup | unlock | en
 
 - `engine.py`: all the sync logic and storage back-ends; on the Pi it's also the `companion-sync` command.
 - `app.py`: the Windows / Mac / Pi desktop tray app (on the Pi: zenity dialogs, AppIndicator icon).
+- `popup.py`: the pop-up window (tkinter, its own process); `web.py`: the web GUI and its local API.
 - `panel/`: an optional 2.4" SPI touchscreen panel for the Pi (`install.sh --panel`).
 - `pi/`: the Pi services (start-up take before Companion or Docker, 15-minute saves), `install.sh` and
   `settings.example.json`.

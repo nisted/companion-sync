@@ -29,6 +29,24 @@ import time
 import urllib.request
 import webbrowser
 
+import json as _json
+
+
+def _rig_setting(key, default=None):
+    """One value from this rig's settings.json, before the engine is loaded."""
+    try:
+        with open(os.path.expanduser("~/.config/companion-sync/settings.json")) as f:
+            return _json.load(f).get(key, default)
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+# Pi: AppIndicator always opens the menu on a click. The GTK tray icon can tell
+# a left click from a right one, but not every taskbar shows it, so it's a
+# setting (tray_left_click), off by default.
+if sys.platform.startswith("linux") and _rig_setting("tray_left_click") and "--popup" not in sys.argv:
+    os.environ.setdefault("PYSTRAY_BACKEND", "gtk")
+
 import pystray
 from PIL import Image, ImageDraw
 
@@ -36,7 +54,8 @@ import engine as E
 from icon import draw_cs
 
 APP = "Companion Sync"
-SAVE_EVERY = 15 * 60        # seconds
+SAVE_EVERY = 15 * 60        # seconds (save_every_min in settings.json changes it)
+GUI_PORT = 8090             # web GUI (gui_port in settings.json changes it)
 CHECK_EVERY = 30            # seconds between Companion / status checks
 STATUS_EVERY = 5 * 60       # seconds between lock checks on the storage when idle
 SINGLE_INSTANCE_PORT = 47823
@@ -58,19 +77,37 @@ UPDATE_ASSET = ("Companion-Sync-Setup.exe" if E.WIN else
 WIN_MUTEX = "CompanionSyncRunning"      # the Windows installer waits for this to go
 
 
-# Windows: a left-click on the tray icon opens the menu, like a right-click,
-# instead of running an action.
-if E.WIN:
-    from pystray import _win32 as _pw
+# A left click runs the menu's default item (Show/Hide window); a right click
+# opens the menu. Windows does this already. The Mac's menu-bar icon opens its
+# menu on any click, so there the clicks come to us and we tell them apart.
+if E.MAC and "--popup" not in sys.argv:
+    try:
+        import AppKit
+        from pystray import _darwin as _pd
 
-    _orig_notify = _pw.Icon._on_notify
+        _orig_init, _orig_update_menu = _pd.Icon.__init__, _pd.Icon._update_menu
 
-    def _left_click_opens_menu(self, wparam, lparam):
-        if lparam == 0x0202:           # WM_LBUTTONUP -> treat as WM_RBUTTONUP
-            lparam = 0x0205
-        return _orig_notify(self, wparam, lparam)
+        def _mac_init(self, *a, **k):
+            _orig_init(self, *a, **k)
+            self._status_item.button().sendActionOn_(
+                AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp)
 
-    _pw.Icon._on_notify = _left_click_opens_menu
+        def _mac_update_menu(self):
+            _orig_update_menu(self)
+            self._status_item.setMenu_(None)          # clicks come to __call__ below
+
+        def _mac_click(self):
+            ev = AppKit.NSApp.currentEvent()
+            right = ev is not None and (ev.type() == AppKit.NSEventTypeRightMouseUp
+                                        or ev.modifierFlags() & AppKit.NSEventModifierFlagControl)
+            if right and self._menu_handle:
+                self._status_item.popUpStatusItemMenu_(self._menu_handle[0])
+            else:
+                _pd._base.Icon.__call__(self)          # the default item
+
+        _pd.Icon.__init__, _pd.Icon._update_menu, _pd.Icon.__call__ = _mac_init, _mac_update_menu, _mac_click
+    except Exception:                                  # keep the plain menu if this ever breaks
+        pass
 
 
 # ---- places ------------------------------------------------------------------
@@ -407,6 +444,13 @@ class App:
         self.warned_not_holding = False
         self.work = threading.Lock()
         self.restart = False          # reopen after an update (Pi)
+        self.st = {}                  # last status from the storage
+        self.signed = None            # signed in to the storage (None: not checked yet)
+        self.encrypted = None
+        self.popup_visible = False
+        self.popup_proc = None
+        self.httpd = None
+        self.latest = None            # (time checked, latest build) for the GUI's Update page
         # On the Pi, a systemd timer may already save every 15 minutes (headless
         # install); then the tray app leaves saving to it.
         self.timer_saves = LINUX and subprocess.run(
@@ -416,26 +460,18 @@ class App:
 
     # -- menu --
     def menu(self):
+        """The mini tray menu, like Companion's. Everything else is in the
+        pop-up window and the web GUI."""
         M = pystray.MenuItem
         return pystray.Menu(
             M(lambda i: self.line, None, enabled=False),
             pystray.Menu.SEPARATOR,
+            M(lambda i: "Hide window" if self.popup_visible else "Show window",
+              lambda: self.popup_toggle(), default=True),
             M("Open Companion", self.bg(self.open_companion)),
-            M("Save now", self.bg(self.save_now), enabled=lambda i: self.mine),
-            M("Return config", self.bg(self.return_now), enabled=lambda i: self.mine),
-            M("Status…", self.bg(self.show_status)),
+            M("Take config", self.bg(self.take_only), enabled=lambda i: not self.mine),
+            M("Launch GUI", lambda: self.launch_gui()),
             pystray.Menu.SEPARATOR,
-            M(lambda i: f"Sign in to {self.s.place}…", self.bg(self.sign_in),
-              visible=lambda i: not E.signed_in(self.s)),
-            M(lambda i: f"Storage: {self.s.place.removeprefix('the ').capitalize()}…", self.bg(self.choose_storage)),
-            M("Encryption…", self.bg(self.encryption)),
-            M("Start at login", lambda: set_login(not login_enabled()),
-              checked=lambda i: login_enabled()),
-            M("Open log", lambda: self.open_path(LOG_FILE)),
-            pystray.Menu.SEPARATOR,
-            M(f"Update {APP}…", self.bg(self.update_app)),
-            M("Get Companion…", lambda: webbrowser.open(E.COMPANION_DOWNLOAD)),
-            M(f"{APP} build {BUILD}", None, enabled=False),
             M(f"Quit {APP}", self.quit),
         )
 
@@ -497,7 +533,16 @@ class App:
             return
         self.last_status = time.time()
         try:
+            self.signed = E.signed_in(self.s)
+        except Exception:
+            self.signed = None
+        try:
             st = E.status(self.s)
+            self.st = st
+            try:
+                self.encrypted = E.encryption_on(self.s)
+            except Exception:
+                self.encrypted = None
         except E.Offline as e:
             self.mine = os.path.exists(self.s.holding_file)
             self.set_state("problem", str(e).splitlines()[0])
@@ -513,7 +558,248 @@ class App:
         else:
             self.set_state("free", "Config is free")
 
+    # -- pop-up window and web GUI --
+    def app_setting(self, key, default):
+        return _rig_setting(key, default)
+
+    def gui_port(self):
+        try:
+            return int(self.app_setting("gui_port", GUI_PORT))
+        except (TypeError, ValueError):
+            return GUI_PORT
+
+    def gui_password(self):
+        return self.app_setting("gui_password", "") or ""
+
+    def gui_url(self):
+        return f"http://127.0.0.1:{self.gui_port()}/"
+
+    def launch_gui(self):
+        webbrowser.open(self.gui_url())
+
+    def logo_path(self):
+        return bundled("logo-source.png")
+
+    def popup_cmd(self):
+        me = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        return me + ["--popup", str(self.gui_port())]
+
+    def popup_start(self):
+        """Start the pop-up's own process (hidden) if it isn't running."""
+        if self.popup_proc and self.popup_proc.poll() is None:
+            return
+        try:
+            self.popup_proc = subprocess.Popen(self.popup_cmd(), env=child_env(), close_fds=True,
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            log.exception("pop-up didn't start")
+
+    def popup_set(self, show):
+        self.popup_visible = bool(show)
+        if show:
+            self.popup_start()
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def popup_toggle(self):
+        self.popup_set(not self.popup_visible)
+
+    def snapshot(self):
+        """Everything the pop-up and the web GUI show, from what's already known
+        (nothing here waits on the storage)."""
+        st = self.st or {}
+        last = self.last_save.strftime("%H:%M") if self.last_save else None
+        if not last:
+            ls = E.read_state(self.s).get("last_save")
+            try:
+                t = datetime.datetime.fromisoformat(ls)
+                last = t.strftime("%H:%M" if t.date() == datetime.date.today() else "%d %b %H:%M")
+            except (TypeError, ValueError):
+                last = None
+        if last and self.last_save:
+            mins = int((datetime.datetime.now() - self.last_save).total_seconds() // 60)
+            last += f" ({mins} min ago)" if mins else " (just now)"
+        running = self.companion_was_running
+        every = self.save_every() // 60
+        if self.state == "mine":
+            detail = f"Saving every {every} min · Companion {'running' if running else 'not running'}"
+        elif self.state == "other":
+            age = st.get("age_hours")
+            detail = f"Last seen {age:.1f} hours ago" if isinstance(age, (int, float)) else ""
+        elif self.state == "free":
+            detail = "Take it here, or open Companion to take it and start"
+        else:
+            detail = ""
+        try:
+            lv = E.vtext(E.local_version(self.s))
+        except Exception:
+            lv = None
+        where = (self.s.folder_path if self.s.storage == "folder" else
+                 self.s.github_repo if self.s.storage == "github" else f"{self.s.place}: {self.s.folder}")
+        return {
+            "state": self.state, "line": self.line, "detail": detail, "mine": self.mine,
+            "holder": st.get("holder"), "age_hours": st.get("age_hours"), "rig": self.s.rig,
+            "build": BUILD, "platform": self.s.platform,
+            "place": self.s.place.removeprefix("the ")[:1].upper() + self.s.place.removeprefix("the ")[1:], "storage_where": where,
+            "signed_in": self.signed, "encrypted": self.encrypted, "last_save": last,
+            "companion_running": running, "local_version": lv,
+            "drive_version": E.vtext(st["drive_version"]) if st.get("drive_version") else None,
+            "companion_desc": E.describe_companion(self.s), "start_at_login": login_enabled(),
+            "popup_visible": self.popup_visible, "busy": self.work.locked(), "gui_url": self.gui_url(),
+        }
+
+    def save_every(self):
+        try:
+            return max(60, int(float(self.app_setting("save_every_min", SAVE_EVERY // 60)) * 60))
+        except (TypeError, ValueError):
+            return SAVE_EVERY
+
+    WEB_ACTIONS = ("open", "take", "save", "return", "storage", "sign_in", "encryption", "update",
+                   "get_companion", "gui", "toggle_login", "status")
+
+    def web_action(self, name):
+        """A button in the pop-up or the web GUI. Long jobs run in the background;
+        their questions appear on this rig's screen."""
+        if name not in self.WEB_ACTIONS:
+            return False, "Unknown action."
+        if name == "gui":
+            self.launch_gui()
+            return True, ""
+        if name == "toggle_login":
+            set_login(not login_enabled())
+            return True, "Start at login is " + ("on." if login_enabled() else "off.")
+        if name == "get_companion":
+            webbrowser.open(E.COMPANION_DOWNLOAD)
+            return True, "The Companion download page opened on this rig."
+        if self.work.locked():
+            return False, "Busy with another job. Try again in a moment."
+        fn = {"open": self.open_companion, "take": self.take_only, "save": self.save_now,
+              "return": self.return_now, "storage": self.choose_storage, "sign_in": self.sign_in,
+              "encryption": self.encryption, "update": self.update_app, "status": self.show_status}[name]
+        self.bg(fn)()
+        return True, {"open": "Opening Companion…", "take": "Taking the config…", "save": "Saving…",
+                      "return": "Returning the config…", "update": "Checking for an update…"}.get(
+                          name, "Carry on on this rig's screen.")
+
+    def check_update(self):
+        """Latest release, checked at most every 10 minutes."""
+        if not self.latest or time.time() - self.latest[0] > 600:
+            try:
+                rel = json.loads(fetch(LATEST_API))
+                self.latest = (time.time(), rel.get("tag_name", "").removeprefix("build-"))
+            except Exception:
+                self.latest = (time.time() - 540, None)       # try again in a minute
+        new = self.latest[1]
+        newer = bool(new and new.isdigit() and (BUILD == "dev" or not str(BUILD).isdigit()
+                                                or int(new) > int(BUILD)))
+        return {"current": BUILD, "latest": new, "newer": newer}
+
+    def log_tail(self, n):
+        try:
+            with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+                return f.read().splitlines()[-n:]
+        except OSError:
+            return []
+
+    # settings.json keys: the engine's own, and the app's
+    APP_KEYS = ("save_every_min", "gui_port", "gui_network", "gui_password", "tray_left_click")
+    ENGINE_KEYS = ("login_action", "keep_history", "keep_local", "stale_hours", "companion_mode")
+
+    def get_settings(self):
+        return {
+            "platform": self.s.platform, "rig": self.s.rig, "holding": bool(self.mine),
+            "start_at_login": login_enabled(), "login_action": self.s.login_action,
+            "save_every_min": self.save_every() // 60, "keep_history": self.s.keep_history,
+            "keep_local": self.s.keep_local, "stale_hours": self.s.stale_hours,
+            "companion_mode": _rig_setting("companion_mode", "auto") or "auto",
+            "gui_port": self.gui_port(), "gui_network": bool(self.app_setting("gui_network", True)),
+            "has_password": bool(self.gui_password()),
+            "tray_left_click": bool(self.app_setting("tray_left_click", False)),
+        }
+
+    def set_settings(self, b):
+        """Save settings from the web GUI into settings.json (and the rig-name file)."""
+        try:
+            with open(self.s.settings_file) as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                saved = {}
+        except (OSError, ValueError):
+            saved = {}
+        restart_keys = ("gui_port", "gui_network", "tray_left_click", "companion_mode")
+        before = {k: saved.get(k) for k in restart_keys}
+        nums = {"save_every_min": (1, 24 * 60), "keep_history": (1, 1000), "keep_local": (1, 1000),
+                "stale_hours": (1, 24 * 365), "gui_port": (1024, 65535)}
+        for k, (lo, hi) in nums.items():
+            if k in b and b[k] is not None:
+                try:
+                    v = float(b[k]) if k == "stale_hours" else int(b[k])
+                except (TypeError, ValueError):
+                    return False, f"{k.replace('_', ' ')} must be a number."
+                if not lo <= v <= hi:
+                    return False, f"{k.replace('_', ' ')} must be between {lo} and {hi}."
+                saved[k] = v
+        if b.get("login_action") in E.LOGIN_ACTIONS:
+            saved["login_action"] = b["login_action"]
+        if self.s.platform == "pi" and b.get("companion_mode") in ("auto",) + E.COMPANION_MODES:
+            saved["companion_mode"] = b["companion_mode"]
+        for k in ("gui_network", "tray_left_click"):
+            if isinstance(b.get(k), bool):
+                saved[k] = b[k]
+        if "gui_password" in b and isinstance(b["gui_password"], str):
+            saved["gui_password"] = b["gui_password"]
+        rig = (b.get("rig") or "").strip()
+        msg = []
+        if rig and rig != self.s.rig:
+            if self.mine:
+                return False, "Return the config before renaming this rig."
+            import re
+            rig = re.sub(r"[^a-z0-9-]+", "-", rig.lower()).strip("-")
+            if not rig:
+                return False, "That rig name has no letters or numbers in it."
+            with open(os.path.join(os.path.expanduser("~"), ".companion-sync-rig-name"), "w") as f:
+                f.write(rig + "\n")
+            self.s.rig = rig
+            msg.append(f"This rig is now called {rig}.")
+        os.makedirs(os.path.dirname(self.s.settings_file), exist_ok=True)
+        tmp = self.s.settings_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(saved, f, indent=2)
+        os.replace(tmp, self.s.settings_file)
+        for k in self.ENGINE_KEYS:                         # take effect now
+            if k in saved and k != "companion_mode":
+                setattr(self.s, k, saved[k])
+        if isinstance(b.get("start_at_login"), bool) and b["start_at_login"] != login_enabled():
+            set_login(b["start_at_login"])
+        msg.append("Settings saved.")
+        if any(saved.get(k) != before[k] for k in restart_keys):
+            msg.append(f"Quit and reopen {APP} for the port, network, tray or Companion "
+                       f"settings to take effect.")
+        return True, " ".join(msg)
+
     # -- actions --
+    def take_only(self):
+        """Take the config without opening Companion."""
+        managed = E.companion_managed(self.s)          # a service / container is stopped and restarted
+        if not managed and E.companion_running(self.s):
+            tell("Companion is open. Quit it first, then take the config.\n\n"
+                 "(Or use Open Companion, which takes it and opens Companion.)")
+            return
+        try:
+            msg = E.take(self.s, confirm_takeover=ask, manage_companion=managed)
+        except E.NoConfigYet as e:
+            if ask(f"{e}\n\nPut this rig's Companion config there and share it from now on?\n"
+                   f"(Do this on the rig whose config you want to keep.)"):
+                self.notify(E.start_sharing(self.s))
+                self.mine = True
+                self.last_save = datetime.datetime.now()
+            return
+        self.mine = True
+        self.last_save = None
+        self.notify(msg)
+
     def open_companion(self, auto=False):
         """Take the config and start Companion. auto=True: run at login (see
         login_action), so a service's admin page isn't opened in the browser."""
@@ -843,6 +1129,8 @@ class App:
             subprocess.run(["xdg-open" if LINUX else "open", p])
 
     def quit(self):
+        if self.popup_proc and self.popup_proc.poll() is None:
+            self.popup_proc.terminate()
         self.icon.stop()
 
     # -- background loop: watch Companion, save every 15 minutes --
@@ -852,7 +1140,7 @@ class App:
             try:
                 self.tick(next_save)
                 if time.time() >= next_save:
-                    next_save = time.time() + SAVE_EVERY
+                    next_save = time.time() + self.save_every()
             except Exception:
                 log.exception("background loop")
             time.sleep(CHECK_EVERY)
@@ -898,11 +1186,19 @@ class App:
         elif login_enabled() and not LINUX:
             set_login(True)                         # point it at this copy (e.g. now installed elsewhere)
 
+        try:
+            import web
+            self.httpd = web.serve(self, self.gui_port(), bool(self.app_setting("gui_network", True)))
+            log.info("web GUI on port %s", self.gui_port())
+        except OSError as e:
+            log.info("web GUI didn't start on port %s: %s", self.gui_port(), e)
+        self.popup_start()                          # hidden until the icon is clicked
+
         def setup(icon):
             icon.visible = True
             self.refresh(force=True)
             if not E.signed_in(self.s):
-                self.notify(f"Not signed in to {self.s.place}. Choose 'Sign in' from the menu.")
+                self.notify(f"Not signed in to {self.s.place}. Use Storage & sign-in in the GUI.")
             elif self.s.login_action == "take_and_open" and LOGGED_IN_START:
                 self.bg(lambda: self.open_companion(auto=True))()
             threading.Thread(target=self.loop, daemon=True).start()
@@ -910,6 +1206,12 @@ class App:
 
 
 def main():
+    if "--popup" in sys.argv:                  # the pop-up window's own process
+        import popup
+        i = sys.argv.index("--popup")
+        port = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else GUI_PORT
+        popup.main(port, bundled("logo-source.png"))
+        return
     # only one copy at a time (e.g. started at login, then opened by hand)
     guard = socket.socket()
     try:

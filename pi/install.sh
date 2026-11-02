@@ -66,7 +66,7 @@ fi
 need=()
 pkgs=(python3-cryptography rsync)
 [ -n "$PANEL" ] && pkgs+=(python3-spidev python3-libgpiod python3-pil python3-numpy)
-[ "$TRAY" = yes ] && pkgs+=(python3-venv python3-gi gir1.2-ayatanaappindicator3-0.1 python3-pil zenity libnotify-bin)
+[ "$TRAY" = yes ] && pkgs+=(python3-venv python3-gi gir1.2-ayatanaappindicator3-0.1 python3-pil python3-pil.imagetk python3-tk zenity libnotify-bin)
 for p in "${pkgs[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
 done

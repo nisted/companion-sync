@@ -29,7 +29,7 @@ jobs:
           python build/write_client.py
           python icon.py
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
+        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --hidden-import web --hidden-import popup --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
       - name: Installer
         shell: pwsh
         run: |
@@ -68,7 +68,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --windowed --name "Companion Sync" --icon icon.png \
             --osx-bundle-identifier uk.co.nigelisted.companionsync \
-            --hidden-import pystray._darwin --add-binary "rclone:." --add-data "logo-source.png:." app.py
+            --hidden-import pystray._darwin --hidden-import web --hidden-import popup --add-binary "rclone:." --add-data "logo-source.png:." app.py
           # menu-bar only: no Dock icon
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
           codesign --force --deep -s - "dist/Companion Sync.app"
@@ -90,7 +90,7 @@ jobs:
       - name: Package for the Pi
         run: |
           mkdir -p pkg/companion-sync
-          cp -r engine.py app.py icon.py logo-source.png _client.py panel pi pkg/companion-sync/
+          cp -r engine.py app.py web.py popup.py icon.py logo-source.png _client.py panel pi pkg/companion-sync/
           echo "${{ github.run_number }}" > pkg/companion-sync/BUILD
           find pkg -name __pycache__ -prune -exec rm -rf {} +
           tar czf Companion-Sync-Pi.tar.gz -C pkg companion-sync

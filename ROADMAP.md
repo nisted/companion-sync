@@ -12,6 +12,8 @@ Tick things off by editing this file.
 - [x] Nige's CS logo
 - [x] "Update Companion Sync" menu item and build number
 - [x] Windows installer; one-click update (download, install, reopen) on Windows, Mac and Pi
+- [x] Companion-style tray: mini menu, pop-up window, web GUI (port 8090), Take config (build 21)
+- [x] Public repo (free)
 - [x] "Get Companion" download page offered when a rig's Companion is too old
 - [x] Left-click on the tray icon opens the menu (Windows)
 - [x] Module sync: installed module versions (incl. custom imports) go to Drive on save/return and are copied onto a rig on take; `modules/modules.json` lists them
@@ -20,20 +22,32 @@ Tick things off by editing this file.
 - [x] Pi start-up check before Companion: takes the config if free, never blocks (about 6 s)
 - [x] Panel RESTART / SHUTDOWN return the config first; UPDATE COMPANION saves first, then installs the latest stable
 - [x] Pi install script; Pi package in each release; UPDATE CS on the panel
+- [x] c3po on Companion 5.1; GitHub key on BD-1 (UPDATE CS works, 2 Nov)
+
+## To test
+
+- [ ] One-click update: Windows (K-2SO), Mac (c3po), Pi (BD-1 done 2 Nov via UPDATE CS)
+- [ ] Pop-up window and left click: Windows, Mac; Pi with `tray_left_click` on
+- [ ] Web GUI from another device on the network
+- [ ] GitHub storage (limited and quick)
+- [ ] Dropbox
+- [ ] OneDrive
+- [ ] Network folder / NAS
+- [ ] iCloud Drive (Windows, Mac)
+- [ ] Move between storages
+- [ ] Encryption on / off
 
 ## Next up
 
-1. [ ] **Mac: update Companion to 5.0.** Open once so it moves the config across, quit, then check Status reads `c3po` and 5.0 on both sides.
-2. [ ] **GitHub read-only key on BD-1** so UPDATE CS works.
-3. [ ] **Stream Deck button: return then shut down** (the panel does this already; a Companion button could call the same).
-4. [ ] **Fix BD-1's low-voltage warning.** Power supply or cable (the panel's SYSTEM tab shows it).
+1. [ ] **Stream Deck button: return then shut down** (the panel does this already; a Companion button could call the same).
+2. [ ] **Fix BD-1's low-voltage warning.** Power supply or cable (the panel's SYSTEM tab shows it).
 
 ## Parked: making it available to others
 
-- [ ] Choice of storage (Google Drive, Dropbox, OneDrive, NAS…) on first run
+- [ ] Choice of storage on first run (built; see To test)
 - [ ] Google sign-in for other people: verification, own client ID, or rclone's built-in
 - [ ] Setup documentation for each storage option
 - [ ] Code signing (Apple about £80/yr, Windows more)
-- [ ] Public repo and licence
+- [ ] Licence
 - [ ] Naming: label as an unofficial community tool, or check with Bitfocus
 - [ ] Decide the support position ("use at your own risk" or otherwise)
