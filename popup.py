@@ -165,17 +165,25 @@ class Popup:
         lab.pack(side="left", padx=z(8))
         for w in (self.chk, lab):
             w.bind("<Button-1>", lambda e: self.post("/api/do/toggle_login"))
+        hide = tk.Label(foot, text="Hide", bg=BTN, fg=TEXT, font=(FONT, z(10)), padx=z(14), pady=z(4),
+                        highlightthickness=1, highlightbackground=PURPLE2, cursor="hand2")
+        hide.pack(side="right")
+        hide.bind("<Button-1>", lambda e: self.post("/api/popup/hide"))
+        hide.bind("<Enter>", lambda e: hide.configure(bg=PURPLE2))
+        hide.bind("<Leave>", lambda e: hide.configure(bg=BTN))
 
-        # Its size comes from what's in it. Centred the first time, then
-        # wherever it was last left.
+        # Its size comes from what's in it, and follows it (only the position is
+        # set, so Tk grows the window when a line wraps). Centred the first time,
+        # then wherever it was last left.
         r.update_idletasks()
-        w, h = max(W, r.winfo_reqwidth()), r.winfo_reqheight()
+        w, h = max(W, r.winfo_reqwidth()), r.winfo_reqheight() + z(30)
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         x, y = (sw - w) // 2, (sh - h) // 2
         pos = load_pos()
         if pos and -w // 2 < pos[0] < sw - 40 and 0 <= pos[1] < sh - 40:
             x, y = pos
-        r.geometry(f"{w}x{h}+{x}+{y}")
+        r.geometry(f"+{x}+{y}")
+        r.minsize(W, 1)
         self.last_pos = (x, y)
         r.bind("<Configure>", self.moved)
 
@@ -201,6 +209,8 @@ class Popup:
         def press(_):
             if b.enabled:
                 self.post(f"/api/do/{key}")
+                if key == "gui":                  # the GUI takes over: get out of the way
+                    self.post("/api/popup/hide")
         b.bind("<Button-1>", press)
         b.bind("<Enter>", lambda e: b.enabled and b.configure(bg=PURPLE2))
         b.bind("<Leave>", lambda e: b.configure(bg=b.base_bg))

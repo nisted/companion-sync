@@ -97,6 +97,7 @@ class Settings:
     rclone: str = "rclone"
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
+    rclone_timeout_min: float = 20     # give up on any one rclone call after this long (settings file)
     state_file: str = ""               # last save / last problem, for the Pi panel
     storage_kind: str = "gdrive"       # which storage was chosen: see STORAGE_KINDS
     storage_file: str = ""             # where the choice is saved
@@ -232,7 +233,7 @@ def default_settings(**kw):
 
 RIG_SETTINGS = ("companion_mode", "companion_base", "companion_app", "companion_process",
                 "companion_owner", "docker_container", "docker_config_path", "admin_url",
-                "login_action", "keep_local", "keep_history", "stale_hours")
+                "login_action", "keep_local", "keep_history", "stale_hours", "rclone_timeout_min")
 COMPANION_MODES = ("service", "desktop", "docker")
 LOGIN_ACTIONS = ("take_and_open", "tray_only")
 
@@ -330,16 +331,31 @@ def _owner(s):
 
 # ---- running things --------------------------------------------------------
 
-def run(cmd, check=True, input=None):
-    r = subprocess.run(cmd, text=True, capture_output=True, input=input, creationflags=NO_WINDOW)
+# Every rclone call gives up on a stalled connection, and never waits for input.
+RCLONE_NET_FLAGS = ["--contimeout", "30s", "--timeout", "60s", "--low-level-retries", "5"]
+
+
+def run(cmd, check=True, input=None, timeout=None):
+    try:
+        r = subprocess.run(cmd, text=True, capture_output=True, input=input, timeout=timeout,
+                           stdin=None if input is not None else subprocess.DEVNULL, creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        mins = round(timeout / 60, 1)
+        raise Offline(f"{os.path.basename(cmd[0])} gave no answer for {mins:g} minutes, so it was stopped. "
+                      f"Is the connection working?")
     if check and r.returncode != 0:
         raise SyncError(f"Command failed: {' '.join(cmd)}\n{r.stderr.strip()}")
     return r
 
 
 def rc(s, *args, check=True, input=None):
-    cmd = [s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + list(s.rclone_flags) + list(args)
-    return run(cmd, check=check, input=input)
+    cmd = ([s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + RCLONE_NET_FLAGS
+           + list(s.rclone_flags) + list(args))
+    try:
+        limit = float(s.rclone_timeout_min) * 60
+    except (TypeError, ValueError):
+        limit = 20 * 60
+    return run(cmd, check=check, input=input, timeout=limit if limit > 0 else None)
 
 
 # ---- local record of how syncing is going (shown on the Pi panel) ----------
@@ -1733,6 +1749,7 @@ def download_modules(s):
                 if name in have:
                     continue
                 dl = os.path.join(tmp, sub, name)
+                s.log(f"Downloading module {name}...")
                 store.copy_down(f"modules/{sub}/{name}", dl)
                 if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
                     s.log(f"Skipped module {name}: incomplete in {s.place}")
