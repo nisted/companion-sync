@@ -22,7 +22,29 @@ STATE = {   # tray colours: border, fill, sub-text
     "problem": ("#d23232", "#3d1a1a", "#f0a6a6"),
     "busy": ("#286edc", "#172a45", "#a8c4f0"),
 }
-W, H = 380, 470
+
+
+def _scale():
+    """Size of the pop-up. Bigger than the mockup's pixels by default (Tk's
+    fonts come out smallest on the Mac), times popup_size % from Settings."""
+    base = 1.45 if sys.platform == "darwin" else 1.2
+    try:
+        with open(os.path.expanduser("~/.config/companion-sync/settings.json")) as f:
+            pct = float(json.load(f).get("popup_size", 100))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pct = 100
+    return base * min(max(pct, 50), 300) / 100
+
+
+S = _scale()
+
+
+def z(n):
+    """Scaled size: pixels and font points."""
+    return max(1, round(n * S))
+
+
+W = z(380)
 FONT = "Segoe UI" if sys.platform == "win32" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
 
 
@@ -57,15 +79,6 @@ class Popup:
         r.configure(bg=BG)
         r.resizable(False, False)
         r.protocol("WM_DELETE_WINDOW", lambda: self.post("/api/popup/hide"))
-        # Centred the first time, then wherever it was last left.
-        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x, y = (sw - W) // 2, (sh - H) // 2
-        pos = load_pos()
-        if pos and -W // 2 < pos[0] < sw - 40 and 0 <= pos[1] < sh - 40:
-            x, y = pos
-        r.geometry(f"{W}x{H}+{x}+{y}")
-        self.last_pos = (x, y)
-        r.bind("<Configure>", self.moved)
         r.withdraw()
         self.win_icon = None                 # the CS logo on the taskbar button, not Tk's quill
         if logo:
@@ -84,52 +97,52 @@ class Popup:
                     pass
 
         head = tk.Frame(r, bg=BG)
-        head.pack(fill="x", padx=20, pady=(18, 10))
+        head.pack(fill="x", padx=z(20), pady=(z(18), z(10)))
         self.logo_img = None
         if logo:
             try:
                 from PIL import Image, ImageTk
-                self.logo_img = ImageTk.PhotoImage(Image.open(logo).convert("RGBA").resize((54, 54)))
-                tk.Label(head, image=self.logo_img, bg=BG).pack(side="left", padx=(0, 14))
+                self.logo_img = ImageTk.PhotoImage(Image.open(logo).convert("RGBA").resize((z(54), z(54))))
+                tk.Label(head, image=self.logo_img, bg=BG).pack(side="left", padx=(0, z(14)))
             except Exception:
                 pass
         t = tk.Frame(head, bg=BG)
         t.pack(side="left")
-        tk.Label(t, text="Companion Sync", bg=BG, fg=TEXT, font=(FONT, 16, "bold")).pack(anchor="w")
-        self.sub = tk.Label(t, text="", bg=BG, fg=DIM, font=(FONT, 10))
+        tk.Label(t, text="Companion Sync", bg=BG, fg=TEXT, font=(FONT, z(16), "bold")).pack(anchor="w")
+        self.sub = tk.Label(t, text="", bg=BG, fg=DIM, font=(FONT, z(10)))
         self.sub.pack(anchor="w")
 
         self.box = tk.Frame(r, bg=BG, highlightthickness=1)
-        self.box.pack(fill="x", padx=20, pady=(4, 12))
+        self.box.pack(fill="x", padx=z(20), pady=(z(4), z(12)))
         inner = tk.Frame(self.box, bg=BG)
-        inner.pack(fill="x", padx=12, pady=10)
-        self.dot = tk.Canvas(inner, width=14, height=14, highlightthickness=0, bg=BG)
-        self.dot.pack(side="left", padx=(0, 10))
+        inner.pack(fill="x", padx=z(12), pady=z(10))
+        self.dot = tk.Canvas(inner, width=z(14), height=z(14), highlightthickness=0, bg=BG)
+        self.dot.pack(side="left", padx=(0, z(10)))
         tt = tk.Frame(inner, bg=BG)
         tt.pack(side="left", fill="x")
-        self.line = tk.Label(tt, text="Starting…", bg=BG, fg=TEXT, font=(FONT, 12, "bold"), anchor="w")
+        self.line = tk.Label(tt, text="Starting…", bg=BG, fg=TEXT, font=(FONT, z(12), "bold"), anchor="w")
         self.line.pack(anchor="w")
-        self.detail = tk.Label(tt, text="", bg=BG, fg=DIM, font=(FONT, 9), anchor="w",
-                               justify="left", wraplength=W - 100)
+        self.detail = tk.Label(tt, text="", bg=BG, fg=DIM, font=(FONT, z(9)), anchor="w",
+                               justify="left", wraplength=W - z(100))
         self.detail.pack(anchor="w")
         self.box_parts = [self.box, inner, self.dot, tt, self.line, self.detail]
 
         rows = tk.Frame(r, bg=BG)
-        rows.pack(fill="x", padx=20)
+        rows.pack(fill="x", padx=z(20))
         self.vals = {}
         for key, label in (("last_save", "Last save"), ("place", "Storage"),
                            ("signed", "Sign-in"), ("enc", "Encryption")):
             tk.Frame(rows, bg=LINE, height=1).pack(fill="x")
             f = tk.Frame(rows, bg=BG)
-            f.pack(fill="x", pady=6)
-            tk.Label(f, text=label, bg=BG, fg=DIM, font=(FONT, 10)).pack(side="left")
-            v = tk.Label(f, text="—", bg=BG, fg=TEXT, font=(FONT, 10))
+            f.pack(fill="x", pady=z(6))
+            tk.Label(f, text=label, bg=BG, fg=DIM, font=(FONT, z(10))).pack(side="left")
+            v = tk.Label(f, text="—", bg=BG, fg=TEXT, font=(FONT, z(10)))
             v.pack(side="right")
             self.vals[key] = v
         tk.Frame(rows, bg=LINE, height=1).pack(fill="x")
 
         grid = tk.Frame(r, bg=BG)
-        grid.pack(fill="x", padx=20, pady=(16, 10))
+        grid.pack(fill="x", padx=z(20), pady=(z(16), z(10)))
         grid.columnconfigure(0, weight=1, uniform="b")
         grid.columnconfigure(1, weight=1, uniform="b")
         self.buttons = {}
@@ -139,19 +152,32 @@ class Popup:
                 ("gui", "Launch GUI ↗", False))):
             b = self.button(grid, label, key, primary)
             b.grid(row=i // 2, column=i % 2, columnspan=2 if key == "gui" else 1,
-                   sticky="ew", padx=0 if key == "gui" else (0 if i % 2 == 0 else 5, 0 if i % 2 else 5),
-                   pady=5)
+                   sticky="ew", padx=0 if key == "gui" else (0 if i % 2 == 0 else z(5), 0 if i % 2 else z(5)),
+                   pady=z(5))
             self.buttons[key] = b
 
         foot = tk.Frame(r, bg=BG)
-        foot.pack(fill="x", padx=20, pady=(4, 16))
-        self.chk = tk.Label(foot, text=" ", bg=PURPLE, fg="white", width=2, font=(FONT, 9, "bold"),
+        foot.pack(fill="x", padx=z(20), pady=(z(4), z(16)))
+        self.chk = tk.Label(foot, text=" ", bg=PURPLE, fg="white", width=2, font=(FONT, z(9), "bold"),
                             cursor="hand2")
         self.chk.pack(side="left")
-        lab = tk.Label(foot, text="Start at login", bg=BG, fg=DIM, font=(FONT, 10), cursor="hand2")
-        lab.pack(side="left", padx=8)
+        lab = tk.Label(foot, text="Start at login", bg=BG, fg=DIM, font=(FONT, z(10)), cursor="hand2")
+        lab.pack(side="left", padx=z(8))
         for w in (self.chk, lab):
             w.bind("<Button-1>", lambda e: self.post("/api/do/toggle_login"))
+
+        # Its size comes from what's in it. Centred the first time, then
+        # wherever it was last left.
+        r.update_idletasks()
+        w, h = max(W, r.winfo_reqwidth()), r.winfo_reqheight()
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x, y = (sw - w) // 2, (sh - h) // 2
+        pos = load_pos()
+        if pos and -w // 2 < pos[0] < sw - 40 and 0 <= pos[1] < sh - 40:
+            x, y = pos
+        r.geometry(f"{w}x{h}+{x}+{y}")
+        self.last_pos = (x, y)
+        r.bind("<Configure>", self.moved)
 
     def moved(self, event):
         if event.widget is not self.root or not self.visible:
@@ -166,8 +192,8 @@ class Popup:
     def button(self, parent, text, key, primary):
         # Labels, not tk.Buttons: the Mac ignores tk.Button colours.
         bg = PURPLE if primary else BTN
-        b = tk.Label(parent, text=text, bg=bg, fg=TEXT, font=(FONT, 11, "bold" if primary else "normal"),
-                     pady=9, highlightthickness=1, highlightbackground=PURPLE2, highlightcolor=PURPLE2,
+        b = tk.Label(parent, text=text, bg=bg, fg=TEXT, font=(FONT, z(11), "bold" if primary else "normal"),
+                     pady=z(9), highlightthickness=1, highlightbackground=PURPLE2, highlightcolor=PURPLE2,
                      cursor="hand2")
         b.enabled = True
         b.base_bg = bg
@@ -231,7 +257,7 @@ class Popup:
             w.configure(bg=fill)
         self.box.configure(highlightbackground=border, highlightcolor=border)
         self.dot.delete("all")
-        self.dot.create_oval(1, 1, 13, 13, fill=border, outline=border)
+        self.dot.create_oval(1, 1, z(14) - 1, z(14) - 1, fill=border, outline=border)
         self.line.configure(text=st.get("line", ""))
         self.detail.configure(text=st.get("detail", ""), fg=subcol)
         self.sub.configure(text=f"{st.get('rig', '')} · build {st.get('build', '')}")

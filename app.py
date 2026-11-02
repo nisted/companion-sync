@@ -635,6 +635,13 @@ class App:
         except OSError:
             log.exception("pop-up didn't start")
 
+    def popup_restart(self):
+        """Start a fresh pop-up (e.g. its size changed), keeping it shown or hidden."""
+        if self.popup_proc and self.popup_proc.poll() is None:
+            self.popup_proc.terminate()
+        self.popup_proc = None
+        self.popup_start()
+
     def popup_set(self, show):
         self.popup_visible = bool(show)
         if show:
@@ -745,7 +752,7 @@ class App:
             return []
 
     # settings.json keys: the engine's own, and the app's
-    APP_KEYS = ("save_every_min", "gui_port", "gui_network", "gui_password", "tray_left_click")
+    APP_KEYS = ("save_every_min", "gui_port", "gui_network", "gui_password", "tray_left_click", "popup_size")
     ENGINE_KEYS = ("login_action", "keep_history", "keep_local", "stale_hours", "companion_mode")
 
     def get_settings(self):
@@ -758,6 +765,7 @@ class App:
             "gui_port": self.gui_port(), "gui_network": bool(self.app_setting("gui_network", True)),
             "has_password": bool(self.gui_password()),
             "tray_left_click": bool(self.app_setting("tray_left_click", False)),
+            "popup_size": self.app_setting("popup_size", 100),
         }
 
     def set_settings(self, b):
@@ -769,10 +777,11 @@ class App:
                 saved = {}
         except (OSError, ValueError):
             saved = {}
+        before_size = saved.get("popup_size", 100)
         restart_keys = ("gui_port", "gui_network", "tray_left_click", "companion_mode")
         before = {k: saved.get(k) for k in restart_keys}
         nums = {"save_every_min": (1, 24 * 60), "keep_history": (1, 1000), "keep_local": (1, 1000),
-                "stale_hours": (1, 24 * 365), "gui_port": (1024, 65535)}
+                "stale_hours": (1, 24 * 365), "gui_port": (1024, 65535), "popup_size": (50, 300)}
         for k, (lo, hi) in nums.items():
             if k in b and b[k] is not None:
                 try:
@@ -814,6 +823,8 @@ class App:
                 setattr(self.s, k, saved[k])
         if isinstance(b.get("start_at_login"), bool) and b["start_at_login"] != login_enabled():
             set_login(b["start_at_login"])
+        if "popup_size" in b and saved.get("popup_size") != before_size:
+            self.popup_restart()
         msg.append("Settings saved.")
         if any(saved.get(k) != before[k] for k in restart_keys):
             msg.append(f"Quit and reopen {APP} for the port, network, tray or Companion "

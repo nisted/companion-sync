@@ -208,6 +208,7 @@ async settings(){const g=await api("/api/settings");const pi=g.platform=="pi";re
 <label class="f"><span>Hours before a lost rig's lock can be taken over</span><input id="stale_hours" type="number" min="1" value="${g.stale_hours}"></label>
 ${pi?`<label class="f"><span>Companion on this Pi</span><select id="companion_mode"><option value="auto">Detect</option><option value="service">Service (CompanionPi)</option><option value="desktop">Desktop app</option><option value="docker">Docker container</option></select></label>
 <div class="chk"><input type="checkbox" id="tray_left_click" ${g.tray_left_click?"checked":""}><label for="tray_left_click">Left click on the tray icon shows the window (experimental; restart needed)</label></div>`:""}
+<label class="f"><span>Pop-up window size (%)</span><input id="popup_size" type="number" min="50" max="300" step="5" value="${g.popup_size}"></label>
 <label class="f"><span>Web GUI port (restart needed)</span><input id="gui_port" type="number" min="1024" max="65535" value="${g.gui_port}"></label>
 <div class="chk"><input type="checkbox" id="gui_network" ${g.gui_network?"checked":""}><label for="gui_network">Other devices on the network can open this page (restart needed)</label></div>
 <label class="f"><span>Password for other devices (blank = none)${g.has_password?" · one is set":""}</span><input id="gui_password" type="password" placeholder="${g.has_password?"unchanged":""}"></label>
@@ -220,7 +221,7 @@ async update(){const u=await api("/api/update");const newer=u.newer;return `<h2>
 };
 async function render(){const h=await R[page]();$("main").innerHTML=h;if(page=="settings"){const g=await api("/api/settings");$("login_action").value=g.login_action;if($("companion_mode"))$("companion_mode").value=g.companion_mode||"auto"}if(page=="log"){const p=$("logp");p.scrollTop=p.scrollHeight}}
 async function saveSettings(){const v=id=>$(id)?$(id).value:undefined,c=id=>$(id)?$(id).checked:undefined;
-const b={rig:v("rig"),start_at_login:c("login"),login_action:v("login_action"),save_every_min:+v("save_every_min"),keep_history:+v("keep_history"),keep_local:+v("keep_local"),stale_hours:+v("stale_hours"),gui_port:+v("gui_port"),gui_network:c("gui_network"),companion_mode:v("companion_mode"),tray_left_click:c("tray_left_click")};
+const b={rig:v("rig"),start_at_login:c("login"),login_action:v("login_action"),save_every_min:+v("save_every_min"),keep_history:+v("keep_history"),keep_local:+v("keep_local"),stale_hours:+v("stale_hours"),gui_port:+v("gui_port"),gui_network:c("gui_network"),companion_mode:v("companion_mode"),tray_left_click:c("tray_left_click"),popup_size:+v("popup_size")};
 if(v("gui_password"))b.gui_password=v("gui_password");if(c("clear_pw"))b.gui_password="";
 const r=await api("/api/settings",b);toast(r.message);render()}
 async function load(){try{S=await api("/api/status")}catch(e){$("pline").textContent="Can't reach Companion Sync";$("pdot").style.background="var(--red)";return}
