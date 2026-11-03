@@ -425,11 +425,11 @@ def run(cmd, check=True, input=None, timeout=None, s=None, transfer=False):
     return r
 
 
-def rc(s, *args, check=True, input=None, transfer=False):
+def rc(s, *args, check=True, input=None, transfer=False, timeout_min=None):
     cmd = ([s.rclone] + (["--config", s.rclone_config] if s.rclone_config else []) + RCLONE_NET_FLAGS
            + (STATS_FLAGS if transfer else []) + list(s.rclone_flags) + list(args))
     try:
-        limit = float(s.rclone_timeout_min) * 60
+        limit = float(s.rclone_timeout_min if timeout_min is None else timeout_min) * 60
     except (TypeError, ValueError):
         limit = 20 * 60
     return run(cmd, check=check, input=input, timeout=limit if limit > 0 else None, s=s, transfer=transfer)
@@ -644,12 +644,60 @@ class RcloneStorage:
     def merge_duplicates(self, rel):
         """Google Drive allows several folders with the same name. Merge them into one
         (rclone keeps every file; identical or clashing files keep the largest). Returns
-        how many extra folders there were."""
-        names = self.dirs(rel, strict=True)
-        extra = len(names) - len(set(names))
-        if extra:
-            rc(self.s, "dedupe", "--dedupe-mode", "largest", self._p(rel), transfer=True)
-        return extra
+        how many extra folders there were.
+
+        rclone merges them one after another with nothing to show for it, so this
+        counts the duplicates that are left every few seconds and reports that as
+        progress. It only gives up if the count stops falling for rclone_timeout_min
+        minutes, or on Cancel."""
+        s = self.s
+
+        def left():
+            names = self.dirs(rel, strict=True)
+            return len(names) - len(set(names))
+        total = left()
+        if not total:
+            return 0
+        s.log(f"Merging {total} duplicate folders in {rel}...")
+        out = {}
+
+        def go():
+            try:
+                rc(s, "dedupe", "--dedupe-mode", "largest", self._p(rel), timeout_min=0)
+            except BaseException as e:               # handed back to the caller below
+                out["e"] = e
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        try:
+            stall = max(1.0, float(s.rclone_timeout_min or 20)) * 60
+        except (TypeError, ValueError):
+            stall = 20 * 60
+        remaining, moved_at, stalled = total, time.monotonic(), False
+        while th.is_alive():
+            th.join(15)
+            if not th.is_alive():
+                break
+            try:
+                now_left = left()
+            except SyncError:
+                now_left = remaining
+            if now_left < remaining:
+                remaining, moved_at = now_left, time.monotonic()
+                s.log(f"{total - remaining} of {total} duplicate folders merged")
+            if s.progress is not None:
+                s.progress.transfer(int(100 * (total - remaining) / total), "", f"{total - remaining} of {total} merged")
+            if time.monotonic() - moved_at > stall:
+                stalled = True
+                if s.cancel is not None:
+                    s.cancel.set()                   # ends the rclone run
+                th.join(30)
+                break
+        if "e" in out:
+            if stalled and isinstance(out["e"], Cancelled):
+                raise Offline(f"No duplicate folder was merged for {stall / 60:g} minutes, so Repair stopped. "
+                              f"Is the connection working? Run it again to carry on.")
+            raise out["e"]
+        return total
 
 
 class FolderStorage:
@@ -1923,8 +1971,11 @@ def repair_modules(s):
     merged = 0
     with _job(s, "Repair"):
         store = data_store(s)
-        for sub in MODULE_KINDS:
+        kinds = list(MODULE_KINDS)
+        for i, sub in enumerate(kinds, 1):
+            _step(s, i, len(kinds) + 1, f"Merging duplicate {MODULE_KINDS[sub]} module folders…")
             merged += store.merge_duplicates(f"modules/{sub}")
+        _step(s, len(kinds) + 1, len(kinds) + 1, "Updating the module list…")
         _write_modules_list(s)
     return merged
 

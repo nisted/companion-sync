@@ -14,6 +14,7 @@ Tick things off by editing this file.
 - [x] Windows installer; one-click update (download, install, reopen) on Windows, Mac and Pi
 - [x] Companion-style tray: mini menu, pop-up window, web GUI (port 8090), Take config (build 21)
 - [x] Public repo (free)
+- [x] v1.3.0: web GUI in the Murasaki style (sticky top bar and menu, collapsible menu, progress in the top bar, tooltips, Help page), tidier Files page, Repair modules with a live count and no total time cap
 - [x] v1.2.0: borderless pop-up (drag anywhere, Hide/Esc), centring fix, GUI questions on the page, Files page, update notices, Mac move-to-Applications and Dock fix, duplicate-module-folder fix + Repair
 - [x] v1.1.0 (build 27): progress + Cancel, version numbers, lost-connection banner, pop-up off the taskbar,
       unblockable Windows installer, rclone time limits
@@ -29,6 +30,7 @@ Tick things off by editing this file.
 
 ## To test
 
+- [ ] v1.3.0: Repair modules to 0 duplicates on the real Drive, then a take on K-2SO
 - [ ] v1.2.0 on K-2SO: take with the Drive duplicates, Repair modules, pop-up centred and borderless
 - [ ] v1.2.0 on c3po: move to Applications, no Dock icon from the pop-up, Downloads prompt gone
 - [ ] Storage & sign-in, Encryption and take-over questions answered on the web GUI page
