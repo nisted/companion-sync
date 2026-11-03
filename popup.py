@@ -6,6 +6,7 @@ owns the app's main thread). It talks to the tray app over the local API:
 reads /api/status every second, sends button presses to /api/do/<action>.
 It's started hidden and shown or hidden by the tray app; closing the window
 only hides it. It quits by itself when the tray app has gone.
+It has no title bar: drag it from anywhere that isn't a button; Hide or Esc closes it.
 """
 import json
 import os
@@ -82,18 +83,19 @@ class Popup:
         self.visible = None
         r = self.root = tk.Tk()
         r.title("Companion Sync")
-        r.configure(bg=BG)
+        r.configure(bg=BG, highlightthickness=1, highlightbackground=PURPLE2, highlightcolor=PURPLE2)
         r.resizable(False, False)
-        # No taskbar button while it's open, like Companion's launcher window.
-        try:
-            if sys.platform == "win32":
-                r.attributes("-toolwindow", True)
-            elif sys.platform.startswith("linux"):
-                r.attributes("-type", "utility")
-        except tk.TclError:
-            pass
+        # No title bar and no taskbar button, like Companion's launcher window.
+        self.borderless()
         r.protocol("WM_DELETE_WINDOW", lambda: self.post("/api/popup/hide"))
         r.withdraw()
+        self.moved_by_user = False
+        self.drag = None
+        r.bind_all("<Escape>", lambda e: self.post("/api/popup/hide"))
+        r.bind_all("<ButtonPress-1>", self.drag_start, add="+")
+        r.bind_all("<B1-Motion>", self.drag_move, add="+")
+        r.bind_all("<ButtonRelease-1>", self.drag_end, add="+")
+        self.mac_background()
         self.win_icon = None                 # the CS logo on the taskbar button, not Tk's quill
         if logo:
             try:
@@ -128,6 +130,12 @@ class Popup:
 
         self.box = tk.Frame(r, bg=BG, highlightthickness=1)
         self.box.pack(fill="x", padx=z(20), pady=(z(4), z(12)))
+        # "Update available" / "Updated to ..." (click to act on it)
+        self.note = tk.Label(r, text="", bg=PURPLE, fg="white", font=(FONT, z(10)), cursor="hand2",
+                             padx=z(10), pady=z(6), wraplength=W - z(70), justify="left")
+        self.note_action = None
+        self.note_shown = False
+        self.note.bind("<Button-1>", lambda e: self.note_action and self.post(self.note_action))
         inner = tk.Frame(self.box, bg=BG)
         inner.pack(fill="x", padx=z(12), pady=z(10))
         self.dot = tk.Canvas(inner, width=z(14), height=z(14), highlightthickness=0, bg=BG)
@@ -200,30 +208,72 @@ class Popup:
         hide.bind("<Enter>", lambda e: hide.configure(bg=PURPLE2))
         hide.bind("<Leave>", lambda e: hide.configure(bg=BTN))
 
-        # Its size comes from what's in it, and follows it (only the position is
-        # set, so Tk grows the window when a line wraps). Centred the first time,
-        # then wherever it was last left.
+        # Its size comes from what's in it. Placed (centred the first time, then wherever
+        # it was last left) each time it is shown, once its content is in, so it is
+        # centred on its real size and not on an empty window's.
+        r.minsize(W, 1)
+
+    def borderless(self):
+        r = self.root
+        try:
+            if sys.platform == "darwin":
+                r.tk.call("::tk::unsupported::MacWindowStyle", "style", r._w, "plain", "none")
+            else:
+                r.overrideredirect(True)
+        except tk.TclError:
+            pass
+
+    def mac_background(self):
+        """Tk makes its process a normal Mac app (Dock icon); turn that back into a background one."""
+        if sys.platform != "darwin":
+            return
+        try:
+            import ctypes
+
+            class PSN(ctypes.Structure):
+                _fields_ = [("hi", ctypes.c_uint32), ("lo", ctypes.c_uint32)]
+            lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+            lib.TransformProcessType(ctypes.byref(PSN(0, 2)), 4)    # kCurrentProcess -> UIElement
+        except Exception:
+            pass
+
+    def place(self):
+        """Put the window where it belongs: the saved spot, else the middle of the screen."""
+        r = self.root
         r.update_idletasks()
-        w, h = max(W, r.winfo_reqwidth()), r.winfo_reqheight() + z(30)
+        w, h = max(W, r.winfo_reqwidth()), r.winfo_reqheight()
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x, y = (sw - w) // 2, (sh - h) // 2
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 2)
         pos = load_pos()
         if pos and -w // 2 < pos[0] < sw - 40 and 0 <= pos[1] < sh - 40:
             x, y = pos
-        r.geometry(f"+{x}+{y}")
-        r.minsize(W, 1)
-        self.last_pos = (x, y)
-        r.bind("<Configure>", self.moved)
+            self.moved_by_user = True
+        if (x, y) != getattr(self, "at", None):
+            r.geometry(f"{w}x{h}+{x}+{y}")
+            self.at = (x, y)
+        else:
+            r.geometry(f"{w}x{h}")
 
-    def moved(self, event):
-        if event.widget is not self.root or not self.visible:
-            return
-        pos = (self.root.winfo_x(), self.root.winfo_y())
-        if pos != self.last_pos:
-            self.last_pos = pos
-            if getattr(self, "_save_job", None):
-                self.root.after_cancel(self._save_job)
-            self._save_job = self.root.after(800, lambda: save_pos(*self.last_pos))
+    # -- dragging: anywhere that isn't a button --
+    def drag_start(self, e):
+        try:
+            if str(e.widget.cget("cursor")) == "hand2":
+                return
+        except tk.TclError:
+            pass
+        self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+
+    def drag_move(self, e):
+        if self.drag:
+            x, y = e.x_root - self.drag[0], e.y_root - self.drag[1]
+            self.root.geometry(f"+{x}+{y}")
+            self.at = (x, y)
+            self.moved_by_user = True
+
+    def drag_end(self, e):
+        if self.drag and self.moved_by_user:
+            save_pos(self.root.winfo_x(), self.root.winfo_y())
+        self.drag = None
 
     def button(self, parent, text, key, primary):
         # Labels, not tk.Buttons: the Mac ignores tk.Button colours.
@@ -282,17 +332,6 @@ class Popup:
         self.root.after(1000, self.poll)
 
     def show(self, st):
-        want = bool(st.get("popup_visible"))
-        if want != self.visible:
-            self.visible = want
-            if want:
-                self.root.deiconify()
-                self.root.lift()
-                self.root.attributes("-topmost", True)
-                self.root.after(300, lambda: self.root.attributes("-topmost", False))
-                self.root.focus_force()
-            else:
-                self.root.withdraw()
         border, fill, subcol = STATE.get(st.get("state"), STATE["free"])
         for w in self.box_parts:
             w.configure(bg=fill)
@@ -315,6 +354,39 @@ class Popup:
         self.set_enabled("take", not st.get("mine"))
         self.chk.configure(text="✓" if st.get("start_at_login") else " ",
                            bg=PURPLE if st.get("start_at_login") else BTN)
+        self.notice(st)
+        want = bool(st.get("popup_visible"))
+        if want != self.visible:
+            self.visible = want
+            if want:
+                self.place()                      # content is in: centre on the real size
+                self.root.deiconify()
+                self.root.lift()
+                self.root.attributes("-topmost", True)
+                self.root.after(300, lambda: self.root.attributes("-topmost", False))
+                self.root.focus_force()
+                self.mac_background()
+            else:
+                self.root.withdraw()
+        elif want and not self.drag:
+            self.place()                          # it grew (progress bar, longer line): stay centred
+
+    def notice(self, st):
+        up, done = st.get("update") or {}, st.get("updated_note")
+        text = action = None
+        if done:
+            text, action = f"{done}  (click to dismiss)", "/api/do/dismiss_updated"
+        elif up.get("newer"):
+            text, action = f"Update available: {up.get('latest')}  (click to update)", "/api/do/update"
+        self.note_action = action
+        if text:
+            self.note.configure(text=text)
+            if not self.note_shown:
+                self.note.pack(fill="x", padx=z(20), pady=(0, z(8)), before=self.box)
+                self.note_shown = True
+        elif self.note_shown:
+            self.note.pack_forget()
+            self.note_shown = False
 
     def show_progress(self, pr, colour, fill):
         if not pr.get("active"):

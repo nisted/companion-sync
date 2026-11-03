@@ -86,6 +86,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/log":
             n = int(parse_qs(u.query).get("lines", ["300"])[0])
             return self._send(200, {"lines": a.log_tail(min(n, 5000))})
+        if u.path == "/api/files":
+            return self._send(200, a.files_overview())
         if u.path == "/api/update":
             return self._send(200, a.check_update())
         return self._send(404, {"error": "not found"})
@@ -98,6 +100,14 @@ class Handler(BaseHTTPRequestHandler):
         if u.path.startswith("/api/do/"):
             ok, msg = a.web_action(u.path[len("/api/do/"):])
             return self._send(200 if ok else 400, {"ok": ok, "message": msg})
+        if u.path == "/api/delete":
+            b = self._body()
+            ok, msg = a.delete_item(b.get("kind"), b.get("name"))
+            return self._send(200 if ok else 400, {"ok": ok, "message": msg})
+        if u.path == "/api/answer":
+            b = self._body()
+            ok = a.answer_prompt(b.get("id"), b.get("value"))
+            return self._send(200, {"ok": ok})
         if u.path == "/api/settings":
             ok, msg = a.set_settings(self._body())
             return self._send(200 if ok else 400, {"ok": ok, "message": msg})
@@ -167,16 +177,26 @@ pre{background:#0c0a12;border:1px solid var(--line);border-radius:8px;padding:12
 #lost{position:fixed;inset:0;background:rgba(8,6,12,.93);display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;z-index:9;padding:24px}
 #lost h1{font-size:34px;margin:0 0 12px;color:#c8b4ff;font-weight:600}
 #lost p{color:var(--dim);margin:0}
+#modal{position:fixed;inset:0;background:rgba(8,6,12,.8);display:none;align-items:center;justify-content:center;z-index:8;padding:20px}
+#modal .box{background:var(--panel);border:1px solid var(--purple2);border-radius:12px;padding:20px 22px;max-width:520px;width:100%;max-height:90vh;overflow:auto}
+#modal .box.problem{border-color:var(--red)}
+#modal p{white-space:pre-wrap;margin:0 0 14px}
+#modal .opt{display:flex;gap:9px;align-items:center;padding:7px 0}
+#modal .opt input{width:auto}
+.banner{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;border:1px solid var(--purple2);background:color-mix(in srgb,var(--purple) 30%,transparent);border-radius:9px;padding:11px 15px;margin-bottom:18px}
+.banner button{padding:6px 12px;font-size:13px}
+.list{margin:0 0 6px}.list .row{align-items:center}.list button{padding:4px 10px;font-size:12px}
 #toast{position:fixed;right:20px;bottom:20px;background:var(--top);border:1px solid var(--purple2);border-radius:8px;padding:12px 16px;max-width:420px;display:none;white-space:pre-wrap}
 @media(max-width:700px){.wrap{flex-direction:column}nav{width:auto;display:flex;flex-wrap:wrap;gap:4px;border-right:0;border-bottom:1px solid var(--line)}nav a{margin:0}main{padding:18px 16px}header .pill{display:none}}
 </style></head><body>
 <header><img src="/logo.png" alt=""><div><h1>Companion Sync</h1><div class="sub" id="sub">&nbsp;</div></div>
 <div class="pill"><span class="dot" id="pdot"></span><span id="pline">…</span></div></header>
 <div class="wrap"><nav id="nav"></nav><main id="main"></main></div>
+<div id="modal"><div class="box" id="mbox"></div></div>
 <div id="toast"></div>
 <div id="lost"><h1>I've got a bad feeling about this...</h1><p id="lostp">Lost contact with Companion Sync. Trying again…</p></div>
 <script>
-const PAGES=[["status","Status"],["storage","Storage & sign-in"],["encryption","Encryption"],["settings","Settings"],["log","Log"],["update","Update"]];
+const PAGES=[["status","Status"],["storage","Storage & sign-in"],["files","Files"],["encryption","Encryption"],["settings","Settings"],["log","Log"],["update","Update"]];
 const COL={mine:"var(--green)",free:"var(--grey)",other:"var(--amber)",problem:"var(--red)",busy:"var(--blue)"};
 let page=(location.hash||"#status").slice(1),S={};
 const $=id=>document.getElementById(id);
@@ -185,6 +205,8 @@ function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";cle
 async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});return r.json()}
 async function act(a){const r=await api("/api/do/"+a,{});toast(r.message||"");setTimeout(load,800)}
 function nav(){$("nav").innerHTML=PAGES.map(([k,l])=>`<a class="${k==page?"on":""}" onclick="go('${k}')">${l}</a>`).join("")}
+async function del(kind,name){if(!confirm("Delete "+(name||"all of Companion's local backups")+"? This can't be undone."))return;
+const r=await api("/api/delete",{kind,name});toast(r.message||"");render()}
 function go(k){page=k;location.hash=k;nav();render()}
 function row(k,v,c){return `<div class="row"><span class="k">${k}</span><span class="${c||""}">${v}</span></div>`}
 const mmss=t=>t==null?"":Math.floor(t/60)+":"+String(t%60).padStart(2,"0");
@@ -192,10 +214,14 @@ function progBox(){const p=S.progress||{};if(!p.active)return "";
 const w=p.pct!=null?p.pct:(p.steps?Math.round(100*(p.step-1)/p.steps):0);
 const extra=[p.pct!=null?p.pct+"%":"",p.speed||"",p.detail||"",mmss(p.elapsed)].filter(x=>x).join(" · ");
 return `<div class="pbar"><i style="width:${w}%"></i></div><div class="prow"><span>${esc(p.action)} ${p.steps?p.step+"/"+p.steps:""} · ${esc(p.text)}${extra?"<br>"+esc(extra):""}</span><button onclick="act('cancel')">Cancel</button></div>`}
+function banners(){let h="";
+if(S.updated_note)h+=`<div class="banner"><span>${esc(S.updated_note)}</span><button onclick="act('dismiss_updated')">OK</button></div>`;
+if(S.update&&S.update.newer)h+=`<div class="banner"><span>Update available: <b>${esc(S.update.latest)}</b> (you have ${esc(S.label||S.build)})</span><button class="p" onclick="act('update')">Update now</button></div>`;
+return h}
 function stateBox(){const c=COL[S.state]||"var(--grey)";return `<div class="state" style="border-color:${c};background:color-mix(in srgb,${c} 16%,transparent);flex-wrap:wrap"><span class="dot" style="background:${c};box-shadow:0 0 8px ${c}"></span><div style="flex:1"><b>${esc(S.line)}</b><span>${esc(S.detail||"")}</span>${progBox()}</div></div>`}
 const ASK='<p class="note">Questions and sign-in windows appear on this rig\'s own screen.</p>';
 const R={
-status(){return `<h2>Status</h2>${stateBox()}<div class="card">
+status(){return `<h2>Status</h2>${banners()}${stateBox()}<div class="card">
 ${row("This rig",esc(S.rig))}${row("Holder",esc(S.holder||(S.mine?S.rig:"nobody")))}
 ${row("Last save",esc(S.last_save||"never"))}
 ${row("Companion",esc((S.companion_running?"Running":"Not running")+(S.local_version?" · "+S.local_version:"")),S.companion_running?"ok":"")}
@@ -208,6 +234,24 @@ storage(){return `<h2>Storage & sign-in</h2><div class="card">${row("Storage",es
 ${row("Signed in",S.signed_in===null?"—":S.signed_in?"Yes":"No",S.signed_in?"ok":"bad")}</div>
 <div class="btns"><button class="p" onclick="act('storage')">Change storage…</button><button onclick="act('sign_in')">Sign in again…</button></div>
 <p class="note">Every rig sharing a config must use the same storage and account. On the rig that has the config, changing storage moves the config.</p>${ASK}`},
+async files(){const f=await api("/api/files");const st=f.storage||{},c=f.companion||{};
+if(f.error)return `<h2>Files</h2><div class="card bad">${esc(f.error)}</div>`;
+const mb=b=>b==null?"":(b/1048576).toFixed(1)+" MB";
+const list=(kind,items,label)=>items&&items.length?`<div class="list">${items.map(n=>`<div class="row"><span>${esc(typeof n=="string"?n:n.name)}${n.bytes!=null?` <span class="k">${mb(n.bytes)}</span>`:""}</span><button onclick="del('${kind}','${esc(typeof n=="string"?n:n.name)}')">Delete</button></div>`).join("")}</div>`:`<p class="note">${label}: none.</p>`;
+const m=st.modules||{};const dups=Object.values(m).reduce((a,x)=>a+x.duplicates,0);
+return `<h2>Files</h2>
+<div class="card"><b>In ${esc(st.where)}</b>${st.error?`<p class="bad">${esc(st.error)}</p>`:`
+<h3>History (earlier saves)</h3>${list("history",st.history,"No history")}
+<h3>Stranded edits</h3>${list("stranded",st.stranded,"No stranded edits")}
+<h3>Modules</h3>${row("Connection modules",(m.modules||{}).count??"—")}${row("Surface modules",(m.surfaces||{}).count??"—")}${row("Duplicate folders",dups,dups?"warn":"ok")}
+<div class="btns"><button onclick="act('repair_modules')" ${dups?"class='p'":""}>Repair modules (merge duplicates)</button></div>
+<p class="note">Google Drive can hold two folders with the same name, which stops a take. Repair merges them; nothing is lost.</p>`}</div>
+<div class="card"><b>Companion on this rig</b>
+${row("Config folder",esc(c.config_folder||c.config_dir||"—"))}${row("Modules here",c.modules?esc(Object.entries(c.modules).map(([k,v])=>v+" "+k).join(", ")):"—")}
+<h3>Companion's local backups</h3>${c.backups?row(c.backups.path,esc(c.backups.count+" item"+(c.backups.count==1?"":"s")+(c.backups.bytes!=null?" · "+mb(c.backups.bytes):""))):""}
+${c.backups&&c.backups.count?`<div class="btns"><button onclick="del('backups','')">Delete all local backups</button></div>`:""}
+<h3>Safety copies (made before each take)</h3>${list("safety",c.safety,"No safety copies")}
+<p class="note">Safety copies live in ${esc(c.safety_dir||"")}.</p></div>`},
 encryption(){return `<h2>Encryption</h2><div class="card">${row("Encryption",S.encrypted===null?"—":S.encrypted?"On":"Off",S.encrypted?"ok":"")}</div>
 <div class="btns"><button class="p" onclick="act('encryption')">${S.encrypted?"Encryption options…":"Turn encryption on…"}</button></div>
 <p class="note">Off by default. Turn it on or off from the rig that has the config. If the passphrase is lost, the copy in storage can't be read.</p>${ASK}`},
@@ -237,12 +281,28 @@ async function saveSettings(){const v=id=>$(id)?$(id).value:undefined,c=id=>$(id
 const b={rig:v("rig"),start_at_login:c("login"),login_action:v("login_action"),save_every_min:+v("save_every_min"),keep_history:+v("keep_history"),keep_local:+v("keep_local"),stale_hours:+v("stale_hours"),gui_port:+v("gui_port"),gui_network:c("gui_network"),companion_mode:v("companion_mode"),tray_left_click:c("tray_left_click"),popup_size:+v("popup_size")};
 if(v("gui_password"))b.gui_password=v("gui_password");if(c("clear_pw"))b.gui_password="";
 const r=await api("/api/settings",b);toast(r.message);render()}
+let shownPrompt=null;
+function prompt(){const p=S.prompt,m=$("modal");if(!p){m.style.display="none";shownPrompt=null;return}
+if(shownPrompt===p.id)return;shownPrompt=p.id;
+let body=`<p>${esc(p.text)}</p>`,btns="";
+if(p.kind=="choose")body+=p.options.map((o,i)=>`<label class="opt"><input type="radio" name="ch" value="${esc(o)}" ${i?"":"checked"}>${esc(o)}</label>`).join("");
+if(p.kind=="secret")body+=`<input id="pin" type="password" autofocus>`;
+if(p.kind=="folder")body+=`<input id="pin" type="text" style="max-width:none" autofocus>`;
+if(p.kind=="ask")btns=`<button class="p" onclick="ans(true)">Yes</button><button onclick="ans(false)">No</button>`;
+else if(p.kind=="tell")btns=`<button class="p" onclick="ans(true)">OK</button>`;
+else btns=`<button class="p" onclick="ansv()">OK</button><button onclick="ans(null)">Cancel</button>`;
+$("mbox").className="box"+(p.problem?" problem":"");$("mbox").innerHTML=body+`<div class="btns">${btns}</div>`;m.style.display="flex";
+const i=$("pin");if(i){i.focus();i.onkeydown=e=>{if(e.key=="Enter")ansv()}}}
+function ansv(){const p=S.prompt;if(!p)return;let v=null;
+if(p.kind=="choose"){const c=document.querySelector("input[name=ch]:checked");v=c?c.value:null}else v=$("pin").value;ans(v)}
+async function ans(v){const p=S.prompt;if(!p)return;$("modal").style.display="none";await api("/api/answer",{id:p.id,value:v});setTimeout(load,300)}
 let misses=0;
 async function load(){try{S=await api("/api/status");misses=0;$("lost").style.display="none"}catch(e){
 if(++misses>=2){$("lostp").textContent="Lost contact with Companion Sync"+(S.rig?" on "+S.rig:"")+". Trying again…";$("lost").style.display="flex"}
 $("pline").textContent="Can't reach Companion Sync";$("pdot").style.background="var(--red)";return}
 $("sub").textContent=S.rig+" · "+(S.label||"build "+S.build);$("pline").textContent=S.line;$("pdot").style.background=COL[S.state]||"var(--grey)";
+prompt();
 if(["status","storage","encryption"].includes(page))render()}
-nav();load().then(()=>{if(!["status","storage","encryption"].includes(page))render()});(function tick(){setTimeout(()=>load().finally(tick),(S.progress&&S.progress.active)?1000:(misses?2000:5000))})();
+nav();load().then(()=>{if(!["status","storage","encryption"].includes(page))render()});(function tick(){setTimeout(()=>load().finally(tick),(S.progress&&S.progress.active)||S.prompt||S.busy?1000:(misses?2000:5000))})();
 </script></body></html>
 """

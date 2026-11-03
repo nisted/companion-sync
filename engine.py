@@ -641,6 +641,16 @@ class RcloneStorage:
     def purge(self, rel):
         rc(self.s, "purge", self._p(rel), check=False)
 
+    def merge_duplicates(self, rel):
+        """Google Drive allows several folders with the same name. Merge them into one
+        (rclone keeps every file; identical or clashing files keep the largest). Returns
+        how many extra folders there were."""
+        names = self.dirs(rel, strict=True)
+        extra = len(names) - len(set(names))
+        if extra:
+            rc(self.s, "dedupe", "--dedupe-mode", "largest", self._p(rel), transfer=True)
+        return extra
+
 
 class FolderStorage:
     """A shared folder: network share / NAS, or a folder a sync app keeps up to
@@ -769,6 +779,9 @@ class FolderStorage:
 
     def purge(self, rel):
         shutil.rmtree(self._p(rel), ignore_errors=True)
+
+    def merge_duplicates(self, rel):
+        return 0                                   # a normal folder can't hold two of the same name
 
 
 # ---- encryption (optional, off by default) ----------------------------------
@@ -1423,6 +1436,9 @@ class GitHubStorage:
         if gone:
             self._commit(gone, f"{self.s.rig}: remove {rel}")
 
+    def merge_duplicates(self, rel):
+        return 0                                   # a git repository can't hold two folders of one name
+
 
 def sign_in(s, client_id, client_secret):
     """Link Google Drive. Opens the browser for the Google sign-in."""
@@ -1884,16 +1900,33 @@ def _local_module_folders(s, sub):
 
 
 def _drive_module_folders(s, sub):
-    return sorted(d for d in s.store.dirs(f"modules/{sub}", strict=True) if MODULE_FOLDER_RE.match(d))
+    """Module folder names in the storage, each once (Google Drive can hold several of one name)."""
+    return sorted({d for d in s.store.dirs(f"modules/{sub}", strict=True) if MODULE_FOLDER_RE.match(d)})
 
 
 def _copy_folder(s, src, dst):
-    """Copy a module folder; Companion's folders may belong to another user (service, container)."""
+    """Copy a module folder; Companion's folders may belong to another user (service, container).
+    A folder that's already there is filled in, not an error; a half-copy is removed."""
     if s.sudo_files:
         run(["sudo", "mkdir", "-p", os.path.dirname(dst)])
-        run(["sudo", "cp", "-a", src, dst])
-    else:
-        shutil.copytree(src, dst)
+        run(["sudo", "cp", "-a", src + "/.", dst] if os.path.isdir(dst) else ["sudo", "cp", "-a", src, dst])
+        return
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    except OSError:
+        shutil.rmtree(dst, ignore_errors=True)
+        raise
+
+
+def repair_modules(s):
+    """Merge duplicate module folders in the storage. Returns how many extra folders were merged."""
+    merged = 0
+    with _job(s, "Repair"):
+        store = data_store(s)
+        for sub in MODULE_KINDS:
+            merged += store.merge_duplicates(f"modules/{sub}")
+        _write_modules_list(s)
+    return merged
 
 
 def upload_modules(s):
@@ -1932,7 +1965,8 @@ def download_modules(s):
     store = data_store(s)
     with tempfile.TemporaryDirectory() as tmp:
         for sub in MODULE_KINDS:
-            have = set(_local_module_folders(s, sub))
+            have = {n for n in _local_module_folders(s, sub)
+                    if os.path.exists(os.path.join(s.base, sub, n, "companion", "manifest.json"))}
             for name in _drive_module_folders(s, sub):
                 if name in have:
                     continue
@@ -1943,11 +1977,82 @@ def download_modules(s):
                     s.log(f"Skipped module {name}: incomplete in {s.place}")
                     continue
                 dst = os.path.join(s.base, sub, name)
+                if os.path.isdir(dst) and not s.sudo_files:
+                    shutil.rmtree(dst, ignore_errors=True)      # an earlier half-copy
                 _copy_folder(s, dl, dst)
                 if s.sudo_files:
                     run(["sudo", "chown", "-R", _owner(s), dst])
                 added.append(name)
     return added
+
+
+# ---- files overview (the GUI's Files page) --------------------------------------
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9._ +=@-]+$")           # one folder name, never a path
+
+
+def _size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def files_overview(s):
+    """What's in the storage and in Companion's own folders, for the Files page."""
+    out = {"storage": {"where": s.place}, "companion": {}}
+    try:
+        st = out["storage"]
+        st["history"] = sorted(s.store.dirs("history", strict=True), reverse=True)
+        st["stranded"] = sorted(s.store.dirs("stranded", strict=True))
+        mods = {}
+        for sub in MODULE_KINDS:
+            names = [d for d in s.store.dirs(f"modules/{sub}", strict=True) if MODULE_FOLDER_RE.match(d)]
+            mods[sub] = {"count": len(set(names)), "duplicates": len(names) - len(set(names))}
+        st["modules"] = mods
+    except SyncError as e:
+        out["storage"]["error"] = str(e).splitlines()[0]
+    c = out["companion"]
+    c["config_dir"] = s.base
+    try:
+        ver = local_version(s)
+        c["version"] = ver
+        c["config_folder"] = os.path.join(s.base, ver)
+        bk = os.path.join(s.base, ver, "backups")
+        c["backups"] = {"path": bk, "count": len(listdir(s, bk)), "bytes": None if s.sudo_files else _size(bk)}
+        c["modules"] = {sub: len(_local_module_folders(s, sub)) for sub in MODULE_KINDS}
+    except SyncError as e:
+        c["error"] = str(e).splitlines()[0]
+    tidy_safety_copies(s)
+    c["safety_dir"] = s.safety_dir
+    c["safety"] = [{"name": n, "bytes": None if s.sudo_files else _size(os.path.join(s.safety_dir, n))}
+                   for n in sorted((n for n in listdir(s, s.safety_dir) if ".before-" in n), reverse=True)]
+    return out
+
+
+def delete_file_item(s, kind, name):
+    """Delete one thing from the Files page. Only these kinds, one plain folder name each."""
+    if kind not in ("history", "stranded", "safety", "backups"):
+        raise SyncError("Can't delete that.")
+    if kind != "backups" and not SAFE_NAME.match(name or ""):
+        raise SyncError("That isn't a name I can delete.")
+    if kind in ("history", "stranded"):
+        s.store.purge(f"{kind}/{name}")
+        return f"Deleted {kind}/{name} from {s.place}."
+    if kind == "safety":
+        p = os.path.join(s.safety_dir, name)
+        if ".before-" not in name or not isdir(s, p):
+            raise SyncError("No such safety copy.")
+        run(["sudo", "rm", "-rf", p]) if s.sudo_files else shutil.rmtree(p)
+        return f"Deleted the safety copy {name}."
+    bk = os.path.join(s.base, local_version(s), "backups")        # all of Companion's local backups
+    if isdir(s, bk):
+        run(["sudo", "rm", "-rf", bk]) if s.sudo_files else shutil.rmtree(bk)
+    return "Deleted Companion's local backups."
 
 
 def _modules_step(s, fn, verb):

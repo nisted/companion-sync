@@ -206,7 +206,53 @@ def _osa(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# Jobs started from the web GUI ask their questions on that page, not in a window on
+# the rig. The job's thread carries the flag; the GUI shows the waiting question.
+_ctx = threading.local()
+WEB_PROMPT_WAIT = 15 * 60                    # give up on an unanswered question after this long
+_web_prompt = {"cur": None, "n": 0, "cv": threading.Condition()}
+
+
+def web_ask(kind, text, options=None, problem=False):
+    """Show a question on the web GUI and wait for its answer. Returns the answer, or None."""
+    cv = _web_prompt["cv"]
+    with cv:
+        while _web_prompt["cur"] is not None:           # one question at a time
+            if not cv.wait(WEB_PROMPT_WAIT):
+                return None
+        _web_prompt["n"] += 1
+        mine = _web_prompt["cur"] = {"id": _web_prompt["n"], "kind": kind, "text": text,
+                                     "options": options or [], "problem": problem, "answer": None,
+                                     "answered": False}
+        ok = cv.wait_for(lambda: mine["answered"], WEB_PROMPT_WAIT)
+        _web_prompt["cur"] = None
+        cv.notify_all()
+        return mine["answer"] if ok else None
+
+
+def web_answer(pid, value):
+    cv = _web_prompt["cv"]
+    with cv:
+        cur = _web_prompt["cur"]
+        if cur and cur["id"] == pid and not cur["answered"]:
+            cur["answer"], cur["answered"] = value, True
+            cv.notify_all()
+            return True
+    return False
+
+
+def web_prompt_view():
+    cur = _web_prompt["cur"]
+    return None if not cur or cur["answered"] else {k: cur[k] for k in ("id", "kind", "text", "options", "problem")}
+
+
+def _web():
+    return getattr(_ctx, "web", False)
+
+
 def ask(msg, title=APP):
+    if _web():
+        return bool(web_ask("ask", msg))
     if LINUX:
         return _zenity("--question", "--no-markup", "--width=460", f"--text={msg}").returncode == 0
     if E.WIN:
@@ -221,6 +267,9 @@ def ask(msg, title=APP):
 
 
 def tell(msg, title=APP, problem=False):
+    if _web():
+        web_ask("tell", msg, problem=problem)
+        return
     if LINUX:
         _zenity("--error" if problem else "--info", "--no-markup", "--width=460", f"--text={msg}")
         return
@@ -239,6 +288,9 @@ def choose(prompt, options, title=APP):
     """Pick one of `options` (strings). Returns it, or None if cancelled."""
     if not options:
         return None
+    if _web():
+        out = web_ask("choose", prompt, list(options))
+        return out if out in options else None
     if LINUX:
         r = _zenity("--list", "--hide-header", "--column=Option", "--width=520",
                     f"--height={160 + 28 * len(options)}", f"--text={prompt}", *options)
@@ -285,6 +337,8 @@ def choose(prompt, options, title=APP):
 
 def ask_secret(prompt, title=APP):
     """Type a passphrase (hidden). Returns it, or None if cancelled."""
+    if _web():
+        return web_ask("secret", prompt) or None
     if LINUX:
         r = _zenity("--entry", "--hide-text", "--width=460", f"--text={prompt}")
         return r.stdout.rstrip("\n") if r.returncode == 0 else None
@@ -325,6 +379,8 @@ def ask_secret(prompt, title=APP):
 
 def pick_folder(prompt, title=APP):
     """Choose a folder. Returns its path, or None if cancelled."""
+    if _web():
+        return (web_ask("folder", prompt + "\n\nType the folder's full path on this rig.") or "").strip() or None
     if LINUX:
         r = _zenity("--file-selection", "--directory")
         return r.stdout.strip().rstrip("/") or None if r.returncode == 0 else None
@@ -361,7 +417,12 @@ def show_github_code(code, url):
     The message is shown on its own thread so the sign-in keeps waiting meanwhile."""
     copy_text(code)
     webbrowser.open(url)
-    threading.Thread(target=tell, daemon=True, args=(
+    web = _web()
+
+    def say(msg):
+        _ctx.web = web
+        tell(msg)
+    threading.Thread(target=say, daemon=True, args=(
         f"Your browser has opened GitHub's sign-in page:\n  {url}\n\n"
         f"Enter this code (it's already copied, so you can paste it):\n\n      {code}\n\n"
         f"Then click Authorize. Companion Sync carries on by itself once you have.",)).start()
@@ -520,6 +581,7 @@ class App:
         self.quitting = False
         self.httpd = None
         self.latest = None            # (time checked, latest build) for the GUI's Update page
+        self.updated_note = self.read_update_marker()
         # On the Pi, a systemd timer may already save every 15 minutes (headless
         # install); then the tray app leaves saving to it.
         self.timer_saves = LINUX and subprocess.run(
@@ -544,10 +606,14 @@ class App:
             M(f"Quit {APP}", self.quit),
         )
 
-    def bg(self, fn):
-        """Run a menu action in the background so the menu never freezes."""
+    def bg(self, fn, web=False):
+        """Run a menu action in the background so the menu never freezes.
+        web=True: it was started from the web GUI, so its questions appear there."""
+        def run():
+            _ctx.web = web
+            self.guarded(fn)
         def go(*_):
-            threading.Thread(target=self.guarded, args=(fn,), daemon=True).start()
+            threading.Thread(target=run, daemon=True).start()
         return go
 
     def guarded(self, fn):
@@ -743,6 +809,8 @@ class App:
             "companion_desc": E.describe_companion(self.s), "start_at_login": login_enabled(),
             "popup_visible": self.popup_visible, "busy": self.work.locked(), "gui_url": self.gui_url(),
             "quitting": self.quitting, "progress": self.s.progress.snapshot() if self.s.progress else {},
+            "update": self.update_cached(), "updated_note": self.updated_note,
+            "prompt": web_prompt_view(),
         }
 
     def save_every(self):
@@ -752,7 +820,8 @@ class App:
             return SAVE_EVERY
 
     WEB_ACTIONS = ("open", "take", "save", "return", "storage", "sign_in", "encryption", "update",
-                   "get_companion", "gui", "toggle_login", "status", "cancel")
+                   "get_companion", "gui", "toggle_login", "status", "cancel", "dismiss_updated",
+                   "repair_modules")
 
     def web_action(self, name):
         """A button in the pop-up or the web GUI. Long jobs run in the background;
@@ -770,6 +839,9 @@ class App:
                 self.s.cancel.set()
                 return True, "Cancelling…"
             return False, "Nothing to cancel."
+        if name == "dismiss_updated":
+            self.updated_note = None
+            return True, ""
         if name == "get_companion":
             webbrowser.open(E.COMPANION_DOWNLOAD)
             return True, "The Companion download page opened on this rig."
@@ -777,11 +849,113 @@ class App:
             return False, "Busy with another job. Try again in a moment."
         fn = {"open": self.open_companion, "take": self.take_only, "save": self.save_now,
               "return": self.return_now, "storage": self.choose_storage, "sign_in": self.sign_in,
-              "encryption": self.encryption, "update": self.update_app, "status": self.show_status}[name]
-        self.bg(fn)()
+              "encryption": self.encryption, "update": self.update_app, "status": self.show_status,
+              "repair_modules": self.repair_modules}[name]
+        self.bg(fn, web=True)()
         return True, {"open": "Opening Companion…", "take": "Taking the config…", "save": "Saving…",
                       "return": "Returning the config…", "update": "Checking for an update…"}.get(
                           name, "Carry on on this rig's screen.")
+
+    def files_overview(self):
+        try:
+            return E.files_overview(self.s)
+        except Exception as e:
+            return {"error": str(e).splitlines()[0] if str(e) else "Couldn't list the files."}
+
+    def delete_item(self, kind, name):
+        if self.work.locked():
+            return False, "Busy with another job. Try again in a moment."
+        if self.mine and kind in ("backups",):
+            return False, "Return the config first: Companion may be using its backups."
+        with self.work:
+            try:
+                return True, E.delete_file_item(self.s, kind, name)
+            except E.SyncError as e:
+                return False, str(e).splitlines()[0]
+
+    def offer_move_to_applications(self):
+        """Mac: a downloaded app run from Downloads keeps asking for access to that folder.
+        Offer once to move it to Applications, and reopen it from there."""
+        try:
+            if not (E.MAC and getattr(sys, "frozen", False)):
+                return
+            app = _mac_app_path()
+            home_apps = os.path.expanduser("~/Applications/")
+            if (not app.endswith(".app") or "/AppTranslocation/" in app
+                    or app.startswith(("/Applications/", home_apps)) or _rig_setting("move_prompt_declined")):
+                return
+            where = next((d for d in ("/Applications", home_apps.rstrip("/"))
+                          if os.path.isdir(d) and os.access(d, os.W_OK)), None)
+            if not where:
+                return
+            time.sleep(3)
+            if not ask(f"{APP} is running from {os.path.dirname(app)}. macOS keeps asking for access to that "
+                       f"folder while it does.\n\nMove it to {where}? The copy here goes to the Bin and "
+                       f"{APP} reopens by itself."):
+                try:
+                    with open(self.s.settings_file) as f:
+                        saved = json.load(f)
+                except (OSError, ValueError):
+                    saved = {}
+                saved["move_prompt_declined"] = True
+                with open(self.s.settings_file, "w") as f:
+                    json.dump(saved, f, indent=2)
+                return
+            dest = os.path.join(where, f"{APP}.app")
+            tmp = tempfile.mkdtemp(prefix="companion-sync-move-")
+            script = os.path.join(tmp, "move.sh")
+            with open(script, "w") as f:
+                f.write('while kill -0 "$1" 2>/dev/null; do sleep 0.5; done\n'
+                        'rm -rf "$3" && ditto "$2" "$3" || exit 1\n'
+                        'xattr -dr com.apple.quarantine "$3" 2>/dev/null\n'
+                        'osascript -e "tell application \\"Finder\\" to delete POSIX file \\"$2\\"" '
+                        '>/dev/null 2>&1\n'
+                        'open "$3"\n')
+            subprocess.Popen(["/bin/sh", script, str(os.getpid()), app, dest],
+                             env=child_env(), start_new_session=True, close_fds=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.quit()
+        except Exception:
+            log.exception("move to Applications")
+
+    def answer_prompt(self, pid, value):
+        return web_answer(pid, value)
+
+    def repair_modules(self):
+        n = E.repair_modules(self.s)
+        tell(f"Merged {n} duplicate module folder{'s' if n != 1 else ''} in {self.s.place}." if n
+             else f"No duplicate module folders in {self.s.place}.")
+
+    def _marker(self):
+        return os.path.join(data_dir(), "updating-from.json")
+
+    def read_update_marker(self):
+        """After an update the new copy says so (and says if the update didn't take)."""
+        try:
+            with open(self._marker()) as f:
+                was = json.load(f)
+            os.remove(self._marker())
+        except (OSError, ValueError):
+            return None
+        if str(was.get("build")) != str(BUILD):
+            return f"Updated to {LABEL}"
+        return f"The update to {was.get('to') or 'the new version'} didn't install. Still on {LABEL}."
+
+    def write_update_marker(self, to):
+        try:
+            with open(self._marker(), "w") as f:
+                json.dump({"build": BUILD, "from": LABEL, "to": to}, f)
+        except OSError:
+            pass
+
+    def update_cached(self):
+        """What the last check found, without going to the network (for the pop-up and GUI)."""
+        if not self.latest or not self.latest[1]:
+            return {"newer": False}
+        new = self.latest[1]
+        newer = bool(new.isdigit() and (BUILD == "dev" or not str(BUILD).isdigit() or int(new) > int(BUILD)))
+        label = self.latest[2] if self.latest[2] and "(" in self.latest[2] else f"build {new}"
+        return {"newer": newer, "latest": label}
 
     def check_update(self):
         """Latest release, checked at most every 10 minutes."""
@@ -1060,6 +1234,7 @@ class App:
         except Exception as e:
             raise E.SyncError(f"The download didn't finish. Try again.\n{e}")
         log.info("update: build %s -> %s", BUILD, new)
+        self.write_update_marker((rel.get("name") or "").removeprefix("Companion Sync ").strip() or f"build {new}")
         self.set_state("busy", f"Installing build {new}…")
         if E.WIN:
             self._update_windows(dest)
@@ -1340,6 +1515,17 @@ class App:
                 time.sleep(1)
         threading.Thread(target=progress_ticker, daemon=True).start()
 
+        def update_watcher():
+            """Look for a newer release now and then, so the pop-up and GUI can say so."""
+            time.sleep(20)
+            while not self.quitting:
+                try:
+                    self.check_update()
+                except Exception:
+                    pass
+                time.sleep(600)
+        threading.Thread(target=update_watcher, daemon=True).start()
+
         def setup(icon):
             icon.visible = True
             self.refresh(force=True)
@@ -1348,6 +1534,7 @@ class App:
             elif self.s.login_action == "take_and_open" and LOGGED_IN_START:
                 self.bg(lambda: self.open_companion(auto=True))()
             threading.Thread(target=self.loop, daemon=True).start()
+            threading.Thread(target=self.offer_move_to_applications, daemon=True).start()
         self.icon.run(setup=setup)
 
 

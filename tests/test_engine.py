@@ -187,6 +187,31 @@ def t_modules_travel(w):
     assert os.path.exists(os.path.join(b.base, "modules", "custom-sq-3.1.1-grid.7", "companion", "manifest.json"))
 
 
+def t_modules_duplicates_and_half_copies(w):
+    """Drive can list one module folder several times, and a half-copy can be left locally:
+    the take must still finish (the K-2SO WinError 183 failure)."""
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    add_module(a.base, "custom-sq-3.1.1-grid.7")
+    E.save(a)
+    E.return_(a)
+    make_config(b.base, value="b")
+    half = os.path.join(b.base, "modules", "custom-sq-3.1.1-grid.7")
+    os.makedirs(os.path.join(half, "junk"))               # left by an earlier failed take, no manifest
+    real_dirs = b.store.dirs
+    def doubled(rel, strict=False):
+        d = real_dirs(rel, strict)
+        return d + d
+    b.store.dirs = doubled
+    try:
+        E.take(b)
+    finally:
+        b.store.dirs = real_dirs
+    assert os.path.exists(os.path.join(half, "companion", "manifest.json"))
+    assert not os.path.exists(os.path.join(half, "junk")), "half-copy replaced"
+    assert E.repair_modules(b) == 0
+
+
 def t_older_companion_refused(w):
     seed(w)
     a, b = w.rigs["alpha"], w.rigs["bravo"]
@@ -562,7 +587,7 @@ def t_cancel_take_restores(w):
 
 
 SCENARIOS = [t_progress_steps, t_cancel_take_restores, t_linux_companion_modes, t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
-             t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel,
+             t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel, t_modules_duplicates_and_half_copies,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
              t_github_quick_setup, t_github_limited]
 
