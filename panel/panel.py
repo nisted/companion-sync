@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""BD-1 panel: Companion Sync status and controls on the 2.4" touchscreen.
+"""BD-1 panel: Companion Sync status and controls on the touchscreen.
 
   python3 panel.py                  run on the Pi (systemd: companion-panel.service)
-  python3 panel.py --preview DIR    render sample screens to PNG files in DIR
+  python3 panel.py --preview DIR    render sample screens to PNG files in DIR,
+                                    one folder per screen and orientation
+
+Every screen is laid out for the size it's drawn at: 2.4" (320x240) or
+3.5" (480x320), landscape or portrait (the "screen" and "rotation" settings).
+The 2.4" landscape layout is the original design; the others are worked out
+from it (see Layout).
 
 Settings: ~/.config/companion-sync/panel.json overrides any of DEFAULTS below.
 """
@@ -29,19 +35,18 @@ import engine as E                                  # noqa: E402
 import info                                         # noqa: E402
 
 DEFAULTS = {
-    # wiring (SHCHV 2.4" RPi Display)
-    "spi_bus": 0, "spi_lcd_cs": 0, "spi_touch_cs": 1,
-    "spi_lcd_hz": 32_000_000, "spi_touch_hz": 1_000_000,
-    "pin_dc": 22, "pin_rst": 27, "pin_touch_irq": 17,
-    "lcd_madctl": 0x28,                       # landscape
-    # touch calibration (raw XPT2046 readings at the screen edges)
-    # (measured on BD-1's screen; run calibrate.py to redo)
-    "touch_x_min": 85, "touch_x_max": 3747, "touch_y_min": 348, "touch_y_max": 3805,
-    "touch_swap_xy": True, "touch_invert_x": False, "touch_invert_y": True,
+    # screen: "2.4" (SHCHV 2.4", 320x240) or "3.5" (3.5" RPi Display, 480x320).
+    # Pins, SPI speed and touch calibration for each are in hw.SCREENS and can
+    # be overridden under "screens": {"3.5": {...}}.
+    "screen": "2.4",
+    "rotation": 0,                            # 0 / 180 landscape, 90 / 270 portrait
+    "spi_bus": 0, "spi_lcd_cs": 0, "spi_touch_cs": 1, "spi_touch_hz": 1_000_000,
     "touch_release_s": 0.15,
     # behaviour
     "confirm_s": 4, "flash_s": 0.5, "frame_s": 0.25,
     "boot_screen_max_s": 150, "temp_warn_c": 75,
+    # screen chooser at power-on: seconds to offer it (0 = off), and each screen's turn
+    "screen_choice_s": 15, "screen_choice_turn_s": 3,
     "sys_check_s": 2, "net_check_s": 15, "companion_check_s": 5,
     "sync_check_s": 120, "latest_check_h": 6, "latest_retry_min": 5,
     # look
@@ -66,10 +71,9 @@ DEFAULTS = {
 }
 SETTINGS_FILE = os.path.expanduser("~/.config/companion-sync/panel.json")
 
-W, H = 320, 240
-TAB_Y = 204
 TABS = ["SYSTEM", "NETWORK", "COMPANION", "SYNC"]
-NEEDS_CONFIRM = {"restart", "shutdown", "return", "update_companion"}
+NEEDS_CONFIRM = {"restart", "shutdown", "return", "update_companion", "calibrate"}
+ROTATION_NAMES = {0: "0° LANDSCAPE", 90: "90° PORTRAIT", 180: "180° LANDSCAPE", 270: "270° PORTRAIT"}
 FAST_RCLONE = ["--contimeout", "10s", "--timeout", "20s", "--retries", "1", "--low-level-retries", "2"]
 
 log = logging.getLogger("panel")
@@ -105,14 +109,48 @@ def font(name, size):
 
 
 class Fonts:
-    mono = font("DejaVuSansMono.ttf", 11)
-    mono_b = font("DejaVuSansMono-Bold.ttf", 11)
-    small = font("DejaVuSansMono.ttf", 9)
-    msg = font("DejaVuSansMono.ttf", 10)
-    big = font("DejaVuSansMono-Bold.ttf", 16)
-    head = font("DejaVuSansCondensed-Bold.ttf", 12)
-    btn = font("DejaVuSansCondensed-Bold.ttf", 11)
-    btn_s = font("DejaVuSansCondensed-Bold.ttf", 9)
+    """The panel's fonts at a scale (1 = the 2.4" design)."""
+
+    def __init__(self, k=1.0):
+        def f(name, size):
+            return font(name, max(7, round(size * k)))
+        self.mono = f("DejaVuSansMono.ttf", 11)
+        self.mono_b = f("DejaVuSansMono-Bold.ttf", 11)
+        self.small = f("DejaVuSansMono.ttf", 9)
+        self.msg = f("DejaVuSansMono.ttf", 10)
+        self.big = f("DejaVuSansMono-Bold.ttf", 16)
+        self.head = f("DejaVuSansCondensed-Bold.ttf", 12)
+        self.btn = f("DejaVuSansCondensed-Bold.ttf", 11)
+        self.btn_s = f("DejaVuSansCondensed-Bold.ttf", 9)
+
+
+class Layout:
+    """Where things go on a screen of W x H.
+
+    The original design is the 2.4" landscape (320x240): header 0-21, content
+    24-204, tabs 204-238. Other sizes keep that design:
+      k   scales fonts, margins and element sizes (1 on the 2.4", 1.33 on the 3.5");
+      y() maps a design content height (24-204) into this screen's content area,
+          so portrait spreads the rows out over its extra height;
+      x positions are measured from the edges, so wider screens get wider rows.
+    Portrait also lays some button groups out in fewer columns."""
+
+    def __init__(self, w, h):
+        self.W, self.H = w, h
+        self.portrait = h > w
+        self.k = min(w / 240, h / 320) if self.portrait else min(w / 320, h / 240)
+        self.tab_y = h - 2 - self.u(34)
+        self.top = self.u(24)
+        self.stretch = (self.tab_y - self.top) / 180
+
+    def u(self, v):
+        return int(round(v * self.k))
+
+    def y(self, v):
+        return int(round(self.top + (v - 24) * self.stretch))
+
+
+Fonts.default = Fonts(1.0)                 # for calibrate.py and other one-offs
 
 
 def build_number():
@@ -143,9 +181,12 @@ PROGRESS_FILE = os.path.expanduser("~/.companion-sync-progress.json")
 class Panel:
     def __init__(self, cfg, hw, settings=None, live=True):
         self.cfg, self.hw, self.live = cfg, hw, live
+        self.relayout()
         self.C = {k: hexrgb(v) for k, v in cfg["colours"].items()}
         self.s = settings
         self.tab = "SYSTEM"
+        self.page = "sync"                  # sync (the four tabs) | menu | screen
+        self.calibrating = False
         self.data = {"system": {}, "network": {}, "companion": {}, "sync": {}, "latest": None,
                      "boot": None}
         self.started = not live
@@ -164,14 +205,30 @@ class Panel:
         self.build = build_number()
         self.logo = self._load_logo()
 
+    def relayout(self):
+        """Fit everything to the screen's current size (it changes with rotation)."""
+        self.L = Layout(getattr(self.hw, "W", 320), getattr(self.hw, "H", 240))
+        self.W, self.H = self.L.W, self.L.H
+        self.F = Fonts(self.L.k)
+        if hasattr(self, "logo"):
+            self.logo = self._load_logo()
+
     # ---- data ----------------------------------------------------------------
     def _load_logo(self):
         p = self.cfg["logo"]
         p = p if os.path.isabs(p) else os.path.join(HERE, p)
         try:
             im = Image.open(p).convert("RGBA")
-            if im.width > W:
-                im = im.resize((W, int(im.height * W / im.width)), Image.LANCZOS)
+            # the 2.4" design shows it at its own size; scale with the screen,
+            # but never wider than the screen or taller than the space above
+            # the start-up list
+            w = min(self.W, int(im.width * self.L.k))
+            h = int(im.height * w / im.width)
+            room = self.startup_y() - self.L.u(32)
+            if h > room:
+                w, h = int(w * room / h), room
+            if (w, h) != im.size:
+                im = im.resize((w, h), Image.LANCZOS)
             return im
         except OSError:
             return None
@@ -272,34 +329,47 @@ class Panel:
         d.polygon(pts, fill=fill, outline=outline, width=width)
 
     def readout(self, d, y, label, value, colour=None):
-        C = self.C
-        d.text((10, y), label, font=Fonts.mono, fill=C["grey"])
-        d.text((W - 10, y), value if value not in (None, "") else "-", font=Fonts.mono_b,
+        """A label and value on one row; y is a design height (see Layout)."""
+        C, L, W = self.C, self.L, self.W
+        y = L.y(y)
+        value = value if value not in (None, "") else "-"
+        d.text((L.u(10), y), label, font=self.F.mono, fill=C["grey"])
+        # a long value on a narrow (portrait) screen drops to the small font
+        room = W - L.u(20) - self.F.mono.getlength(label + "  ")
+        f = self.F.mono_b if self.F.mono_b.getlength(value) <= room else self.F.small
+        d.text((W - L.u(10), y + (0 if f is self.F.mono_b else L.u(2))), value, font=f,
                fill=colour or C["cyan"], anchor="ra")
-        d.line((10, y + 15, W - 10, y + 15), fill=C["rule"])
+        d.line((L.u(10), y + L.u(15), W - L.u(10), y + L.u(15)), fill=C["rule"])
 
     def bar(self, d, y, label, frac, colour=None):
-        C = self.C
+        C, L, W = self.C, self.L, self.W
+        y = L.y(y)
         colour = colour or C["cyan"]
-        d.text((10, y), label, font=Fonts.mono, fill=C["grey"])
-        d.rectangle((80, y + 2, W - 50, y + 11), outline=C["cyan_dim"])
+        x0, x1 = L.u(80), W - L.u(50)
+        d.text((L.u(10), y), label, font=self.F.mono, fill=C["grey"])
+        d.rectangle((x0, y + L.u(2), x1, y + L.u(11)), outline=C["cyan_dim"])
         if frac is not None:
-            d.rectangle((81, y + 3, 81 + int((W - 132) * frac), y + 10), fill=colour)
-        d.text((W - 10, y), f"{int(frac * 100)}%" if frac is not None else "-",
-               font=Fonts.mono_b, fill=colour, anchor="ra")
+            d.rectangle((x0 + 1, y + L.u(3), x0 + 1 + int((x1 - x0 - 2) * frac), y + L.u(10)), fill=colour)
+        d.text((W - L.u(10), y), f"{int(frac * 100)}%" if frac is not None else "-",
+               font=self.F.mono_b, fill=colour, anchor="ra")
 
-    def button(self, d, box, bid, label, style="purple", enabled=True):
+    def button(self, d, box, bid, label, style="purple", enabled=True, current=False):
         C = self.C
+        L, F = self.L, self.F
+        cut = L.u(6)
         if self.confirm and self.confirm[0] == bid:
-            self.chamfer(d, box, 6, C["red"], C["red_dim"])
+            self.chamfer(d, box, cut, C["red"], C["red_dim"])
             cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-            if box[2] - box[0] > 150:
-                d.text((cx, cy), "TAP AGAIN TO CONFIRM", font=Fonts.btn, fill=C["lavender"], anchor="mm")
+            if F.btn.getlength("TAP AGAIN TO CONFIRM") < box[2] - box[0] - L.u(10):
+                d.text((cx, cy), "TAP AGAIN TO CONFIRM", font=F.btn, fill=C["lavender"], anchor="mm")
             else:
-                d.text((cx, cy - 6), "TAP AGAIN", font=Fonts.btn_s, fill=C["lavender"], anchor="mm")
-                d.text((cx, cy + 6), "TO CONFIRM", font=Fonts.btn_s, fill=C["lavender"], anchor="mm")
+                d.text((cx, cy - L.u(6)), "TAP AGAIN", font=F.btn_s, fill=C["lavender"], anchor="mm")
+                d.text((cx, cy + L.u(6)), "TO CONFIRM", font=F.btn_s, fill=C["lavender"], anchor="mm")
         else:
-            if not enabled:
+            if current:
+                outline, fill, text = C["green"], hexrgb("#0c2a14"), C["green"]
+                enabled = False
+            elif not enabled:
                 outline, fill, text = C["faint"], C["bg"], C["faint"]
             elif style == "red":
                 outline, fill, text = C["red"], C["red_dim"], C["red"]
@@ -307,27 +377,45 @@ class Panel:
                 outline, fill, text = C["cyan"], C["cyan_dim"], C["cyan"]
             else:
                 outline, fill, text = C["purple"], C["purple_dim"], C["lavender"]
-            self.chamfer(d, box, 6, outline, fill)
-            d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), label, font=Fonts.btn,
+            self.chamfer(d, box, cut, outline, fill)
+            f = F.btn if F.btn.getlength(label) < box[2] - box[0] - L.u(8) else F.btn_s
+            d.text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), label, font=f,
                    fill=text, anchor="mm")
         if enabled:
             self.hits.append((box, bid))
 
-    def frame(self, title, alerts, flash_on):
-        C = self.C
+    def frame(self, title, alerts, flash_on, tabs=True):
+        C, L, F, W, H = self.C, self.L, self.F, self.W, self.H
+        u, tab_y = L.u, L.tab_y
         img = Image.new("RGB", (W, H), C["bg"])
         d = ImageDraw.Draw(img)
-        for y in range(24, TAB_Y - 2, 6):
+        for y in range(L.top, (tab_y - 2) if tabs else H, u(6)):
             d.line((0, y, W, y), fill=C["scan"])
-        d.polygon([(0, 0), (200, 0), (186, 20), (0, 20)], fill=C["purple_dim"])
-        d.text((6, 3), f"BD-1 // {title}", font=Fonts.head, fill=C["lavender"])
-        d.text((W - 6, 4), time.strftime("%H:%M"), font=Fonts.mono_b, fill=C["cyan"], anchor="ra")
+        # header: title block, status pips, clock (the block shrinks on narrow screens)
+        clock_w = F.mono_b.getlength("00:00")
+        pip = u(11)
+        pips_x = min(u(204), int(W - u(6) - clock_w - u(8) - pip * len(TABS)))
+        hb = u(20)
+        d.polygon([(0, 0), (pips_x - u(4), 0), (pips_x - u(4) - hb * 7 // 10, hb), (0, hb)], fill=C["purple_dim"])
+        # the title block is the menu button: three bars, then the title
+        bx, bw = u(6), u(10)
+        for i in range(3):
+            y = u(5) + i * u(4)
+            d.rectangle((bx, y, bx + bw, y + max(1, u(2)) - 1), fill=C["lavender"])
+        d.text((bx + bw + u(6), u(3)), f"BD-1 // {title}", font=F.head, fill=C["lavender"])
+        # generous: the whole header and a little below, so a tap near the edge still counts
+        self.hits.append(((0, 0, W, u(32)), "menu"))
+        d.text((W - u(6), u(4)), time.strftime("%H:%M"), font=F.mono_b, fill=C["cyan"], anchor="ra")
         for i, t in enumerate(TABS):                       # one status pip per tab
             col = C["red"] if t in alerts else C["green"]
-            d.rectangle((204 + i * 11, 7, 210 + i * 11, 13), fill=col)
-        d.line((0, 21, W, 21), fill=C["purple"])
+            d.rectangle((pips_x + i * pip, u(7), pips_x + i * pip + u(6), u(13)), fill=col)
+        d.line((0, u(21), W, u(21)), fill=C["purple"])
+        if not tabs:
+            return img, d
+        tw = W / len(TABS)
+        tab_font = F.btn if max(F.btn.getlength(t) for t in TABS) < tw - u(8) else F.btn_s
         for i, name in enumerate(TABS):
-            x0, x1 = i * 80 + 1, i * 80 + 78
+            x0, x1 = int(i * tw) + 1, int((i + 1) * tw) - 2
             on, alarm = name == self.tab, name in alerts and flash_on
             if alarm:
                 outline, fill, text = C["red"], C["red"] if on else C["red_dim"], C["lavender"]
@@ -335,9 +423,9 @@ class Panel:
                 outline, fill, text = C["purple"], C["purple"], C["bg"]
             else:
                 outline, fill, text = C["purple_dim"], C["bg"], C["purple"]
-            self.chamfer(d, (x0, TAB_Y, x1, H - 2), 7, outline, fill)
-            d.text(((x0 + x1) // 2, (TAB_Y + H) // 2), name, font=Fonts.btn, fill=text, anchor="mm")
-            self.hits.append(((x0, TAB_Y, x1, H - 1), "tab:" + name))
+            self.chamfer(d, (x0, tab_y, x1, H - 2), u(7), outline, fill)
+            d.text(((x0 + x1) // 2, (tab_y + H) // 2), name, font=tab_font, fill=text, anchor="mm")
+            self.hits.append(((x0, tab_y, x1, H - 1), "tab:" + name))
         return img, d
 
     # ---- screens ---------------------------------------------------------------
@@ -361,14 +449,17 @@ class Panel:
         self.bar(d, 86, "CPU LOAD", sy.get("cpu"))
         self.bar(d, 104, "MEMORY", sy.get("mem"))
         self.bar(d, 122, "STORAGE", sy.get("disk"), C["red"] if (sy.get("disk") or 0) > 0.9 else None)
-        self.button(d, (10, 152, 152, 194), "restart", "RESTART")
-        self.button(d, (168, 152, 310, 194), "shutdown", "SHUTDOWN", "red")
+        L, W = self.L, self.W
+        y0, y1 = L.y(152), L.y(194)
+        mid, gap = W // 2, L.u(8)
+        self.button(d, (L.u(10), y0, mid - gap, y1), "restart", "RESTART")
+        self.button(d, (mid + gap, y0, W - L.u(10), y1), "shutdown", "SHUTDOWN", "red")
 
     def draw_network(self, d):
-        C, ne = self.C, self.data["network"]
-        d.text((10, 30), ne.get("ip") or "NO ADDRESS", font=Fonts.big,
+        C, ne, L = self.C, self.data["network"], self.L
+        d.text((L.u(10), L.y(30)), ne.get("ip") or "NO ADDRESS", font=self.F.big,
                fill=C["cyan"] if ne.get("ip") else C["red"])
-        d.text((10, 50), "PRIMARY ADDRESS", font=Fonts.mono, fill=C["grey"])
+        d.text((L.u(10), L.y(30) + L.u(20)), "PRIMARY ADDRESS", font=self.F.mono, fill=C["grey"])
         self.readout(d, 72, "HOSTNAME", ne.get("hostname"))
         if ne.get("link"):
             sp = ne.get("speed")
@@ -387,11 +478,13 @@ class Panel:
                          C["green"] if ok else C["red"])
 
     def draw_companion(self, d):
-        C, co, ne = self.C, self.data["companion"], self.data["network"]
+        C, co, ne, L, W = self.C, self.data["companion"], self.data["network"], self.L, self.W
+        u = L.u
         running = co.get("running")
         col = C["green"] if running else C["red"]
-        d.ellipse((10, 32, 22, 44), fill=col if co else C["faint"])
-        d.text((30, 29), ("RUNNING" if running else "STOPPED") if co else "CHECKING", font=Fonts.big,
+        y = L.y(29)
+        d.ellipse((u(10), y + u(3), u(22), y + u(15)), fill=col if co else C["faint"])
+        d.text((u(30), y), ("RUNNING" if running else "STOPPED") if co else "CHECKING", font=self.F.big,
                fill=col if co else C["grey"])
         v, latest, upd = co.get("version"), self.data.get("latest"), self.update_available()
         self.readout(d, 56, "INSTALLED", f"v{v}" if v else None)
@@ -399,17 +492,20 @@ class Panel:
         ip = ne.get("ip")
         self.readout(d, 92, "ADMIN PAGE", f"{ip}:{self.cfg['companion_port']}" if ip else None)
         self.readout(d, 110, "RUNNING FOR", info.duration(co.get("running_for")) if running else None)
+        box = (u(10), L.y(156), W - u(10), L.y(196))
         if upd:
-            self.chamfer(d, (10, 132, 310, 148), 4, C["purple_dim"], hexrgb("#220046"))
-            d.text((160, 140), "UPDATE AVAILABLE", font=Fonts.btn, fill=C["lavender"], anchor="mm")
-            self.button(d, (10, 156, 310, 196), "update_companion", f"UPDATE TO v{latest} (STABLE)")
+            y = L.y(132)
+            self.chamfer(d, (u(10), y, W - u(10), y + u(16)), u(4), C["purple_dim"], hexrgb("#220046"))
+            d.text((W // 2, y + u(8)), "UPDATE AVAILABLE", font=self.F.btn, fill=C["lavender"], anchor="mm")
+            self.button(d, box, "update_companion", f"UPDATE TO v{latest} (STABLE)")
         else:
-            self.button(d, (10, 156, 310, 196), "update_companion",
+            self.button(d, box, "update_companion",
                         "UP TO DATE" if latest else "LATEST VERSION UNKNOWN", enabled=False)
 
     def draw_sync(self, d):
-        C, sn = self.C, self.data["sync"]
-        d.text((10, 27), "CONFIG HELD BY", font=Fonts.mono, fill=C["grey"])
+        C, sn, L, W = self.C, self.data["sync"], self.L, self.W
+        u = L.u
+        d.text((u(10), L.y(27)), "CONFIG HELD BY", font=self.F.mono, fill=C["grey"])
         holder = sn.get("holder")
         if not sn:
             who, col = "CHECKING", C["grey"]
@@ -418,7 +514,7 @@ class Panel:
         else:
             who = holder.upper() if holder else "NOBODY"
             col = C["green"] if sn.get("mine") else C["amber"] if holder else C["grey"]
-        d.text((W - 10, 25), who, font=Fonts.big, fill=col, anchor="ra")
+        d.text((W - u(10), L.y(25)), who, font=self.F.big, fill=col, anchor="ra")
         self.readout(d, 44, "LAST SAVE", info.ago(sn.get("last_save")) or ("never" if sn else None))
         if sn.get("signed_in") is False:
             drive = ("NOT SIGNED IN", C["red"])
@@ -431,79 +527,167 @@ class Panel:
         self.readout(d, 60, "DRIVE", *drive)
         self.readout(d, 76, "COMPANION SYNC", version_label().upper())
         problem = self.sync_problem()
-        if not self.draw_progress(d, 88) and problem:
-            d.text((160, 96), problem, font=Fonts.btn, fill=C["red"], anchor="mm")
-        bw, bh, gap = 96, 34, 6
-        for i, (bid, label, style) in enumerate((("take", "TAKE", "purple"), ("save", "SAVE NOW", "cyan"),
-                                                 ("return", "RETURN", "purple"), ("status", "STATUS", "cyan"),
-                                                 ("log", "LOG", "cyan"), ("update_cs", "UPDATE CS", "cyan"))):
-            x = 10 + (i % 3) * (bw + gap)
-            y = 108 + (i // 3) * (bh + gap)
-            self.button(d, (x, y, x + bw, y + bh), bid, label, style)
+        if not self.draw_progress(d, L.y(88)) and problem:
+            d.text((W // 2, L.y(96)), problem, font=self.F.btn, fill=C["red"], anchor="mm")
+        buttons = (("take", "TAKE", "purple"), ("save", "SAVE NOW", "cyan"),
+                   ("return", "RETURN", "purple"), ("status", "STATUS", "cyan"),
+                   ("log", "LOG", "cyan"), ("update_cs", "UPDATE CS", "cyan"))
+        cols = 2 if L.portrait else 3
+        rows = -(-len(buttons) // cols)
+        gap = u(6)
+        top, bottom = L.y(108), L.y(182)                   # design: two rows, 108-182
+        bw = (W - u(20) - gap * (cols - 1)) / cols
+        bh = (bottom - top - gap * (rows - 1)) / rows
+        for i, (bid, label, style) in enumerate(buttons):
+            x = u(10) + (i % cols) * (bw + gap)
+            y = top + (i // cols) * (bh + gap)
+            self.button(d, (int(x), int(y), int(x + bw), int(y + bh)), bid, label, style)
 
-    def draw_progress(self, d, y, x0=10, x1=W - 10):
+    def draw_menu(self, d):
+        """What the panel shows. Tap the title block to come back here."""
+        L, W, H, u = self.L, self.W, self.H, self.L.u
+        entries = [("page:sync", "COMPANION SYNC", "purple", True),
+                   ("page:rebeldeck", "REBELDECK  (COMING)", "purple", False),
+                   ("page:screen", "SCREEN", "cyan", True)]
+        top, bottom, gap = L.top + u(6), H - u(10), u(8)
+        bh = (bottom - top - gap * (len(entries) - 1)) / len(entries)
+        for i, (bid, label, style, on) in enumerate(entries):
+            y = top + i * (bh + gap)
+            self.button(d, (u(10), int(y), W - u(10), int(y + bh)), bid, label, style, enabled=on)
+
+    def draw_screen(self, d):
+        """Screen settings: rotation and touch calibration."""
+        from hw import screen_name, screen_size
+        C, L, W, H, u, F = self.C, self.L, self.W, self.H, self.L.u, self.F
+        rot = int(self.cfg.get("rotation", 0)) % 360
+        w, h = screen_size({**self.cfg, "rotation": 0})
+        y = L.top + u(4)
+        for label, value in (("SCREEN", f'{screen_name(self.cfg)}"  {w}x{h}'),
+                             ("ROTATION", ROTATION_NAMES.get(rot, str(rot)))):
+            d.text((u(10), y), label, font=F.mono, fill=C["grey"])
+            d.text((W - u(10), y), value, font=F.mono_b, fill=C["cyan"], anchor="ra")
+            d.line((u(10), y + u(15), W - u(10), y + u(15)), fill=C["rule"])
+            y += u(19)
+        # four rotation buttons, two by two, then calibrate across the bottom
+        gap = u(8)
+        cal_h = u(38)
+        top, bottom = y + u(6), H - u(10) - cal_h - gap
+        bw, bh = (W - u(20) - gap) / 2, (bottom - top - gap) / 2
+        for i, r in enumerate((0, 90, 180, 270)):
+            x = u(10) + (i % 2) * (bw + gap)
+            yy = top + (i // 2) * (bh + gap)
+            self.button(d, (int(x), int(yy), int(x + bw), int(yy + bh)), f"rot:{r}",
+                        ROTATION_NAMES[r], "purple", current=(r == rot))
+        self.button(d, (u(10), H - u(10) - cal_h, W - u(10), H - u(10)), "calibrate", "CALIBRATE TOUCH", "cyan")
+
+    def set_rotation(self, rot):
+        """Turn the panel now and remember it in panel.json."""
+        self.cfg["rotation"] = rot
+        if self.live:
+            save_setting("rotation", rot)
+        self.hw.set_rotation(rot)
+        self.relayout()
+        log.info("rotation set to %s on the panel", rot)
+
+    def do_calibrate(self):
+        """Hand the screen to calibrate.py's steps, then take it back."""
+        import calibrate
+        self.calibrating = True
+        try:
+            time.sleep(0.3)                 # let the main loop stand back
+            calibrate.run(self.hw, self.cfg, timeout=60, test_s=10)
+            self.message("CALIBRATED", "Touch calibration saved for this screen.")
+        except calibrate.TimedOut:
+            self.message("NOT CALIBRATED", "No tap for a minute, so nothing was changed.",
+                         colour=self.C["amber"])
+        finally:
+            self.hw.frame = None
+            self.calibrating = False
+
+    def draw_progress(self, d, y, x0=None, x1=None):
         """A take / save / return running here or in the tray app or timer:
-        a bar with step and %. True if one is running."""
+        a bar with step and %. y is in pixels. True if one is running."""
         pr = E.read_progress(PROGRESS_FILE)
         if not pr.get("active"):
             return False
-        C = self.C
+        C, u, F = self.C, self.L.u, self.F
+        x0 = u(10) if x0 is None else x0
+        x1 = self.W - u(10) if x1 is None else x1
         pct = pr.get("pct")
         steps = pr.get("steps") or 0
         frac = pct / 100 if pct is not None else ((pr.get("step", 1) - 1) / steps if steps else 0)
         label = f"{pr.get('action', '').upper()} {pr.get('step', '')}/{steps}" if steps else pr.get("action", "").upper()
-        d.text((x0, y), label, font=Fonts.mono, fill=C["cyan"])
+        d.text((x0, y), label, font=F.mono, fill=C["cyan"])
         if pct is not None:
-            d.text((x1, y), f"{pct}%", font=Fonts.mono, fill=C["cyan"], anchor="ra")
-        d.rectangle((x0, y + 12, x1, y + 17), fill=hexrgb("#0e0618"), outline=C["purple_dim"])
-        d.rectangle((x0, y + 12, x0 + int((x1 - x0) * max(0, min(frac, 1))), y + 17), fill=C["purple"])
+            d.text((x1, y), f"{pct}%", font=F.mono, fill=C["cyan"], anchor="ra")
+        d.rectangle((x0, y + u(12), x1, y + u(17)), fill=hexrgb("#0e0618"), outline=C["purple_dim"])
+        d.rectangle((x0, y + u(12), x0 + int((x1 - x0) * max(0, min(frac, 1))), y + u(17)), fill=C["purple"])
         return True
 
     def draw_overlay(self, d):
-        C, o = self.C, self.overlay
-        box = (8, 26, W - 8, TAB_Y - 4)
-        self.chamfer(d, box, 8, C["purple"], hexrgb("#0e0618"), 2)
+        C, o, L, F, W = self.C, self.overlay, self.L, self.F, self.W
+        u = L.u
+        box = (u(8), u(26), W - u(8), L.tab_y - u(4))
+        self.chamfer(d, box, u(8), C["purple"], hexrgb("#0e0618"), max(2, u(2)))
         title = o.get("title", "")
         if o["kind"] == "busy":
             title += "." * (int(time.time() * 2) % 4)
-        d.text((18, 32), title, font=Fonts.head, fill=C["lavender"])
-        d.line((18, 48, W - 18, 48), fill=C["purple_dim"])
+        d.text((u(18), u(32)), title, font=F.head, fill=C["lavender"])
+        d.line((u(18), u(48), W - u(18), u(48)), fill=C["purple_dim"])
         if o["kind"] == "busy":
-            self.draw_progress(d, box[3] - 30, 18, W - 18)
-        f = Fonts.small if o.get("small") else Fonts.msg
-        y = 54
-        for line in o.get("lines", []):
-            if y > box[3] - (40 if o.get("buttons") else 14):
+            self.draw_progress(d, box[3] - u(30), u(18), W - u(18))
+        small = o.get("small")
+        f = F.small if small else F.msg
+        y = u(54)
+        bh = u(28) if not L.portrait else u(36)
+        for line in wrap(o.get("lines", []), self.wrap_chars(small)):
+            if y > box[3] - (bh + u(12) if o.get("buttons") else u(14)):
                 break
-            d.text((18, y), line, font=f, fill=o.get("colour") or C["cyan"])
-            y += 11 if o.get("small") else 13
+            d.text((u(18), y), line, font=f, fill=o.get("colour") or C["cyan"])
+            y += u(11) if small else u(13)
         buttons = o.get("buttons") or []
         if buttons:
-            n, bw = len(buttons), (W - 36 - 8 * (len(buttons) - 1)) // len(buttons)
+            gap = u(8)
+            bw = (W - u(36) - gap * (len(buttons) - 1)) // len(buttons)
             for i, (label, bid, style) in enumerate(buttons):
-                x = 18 + i * (bw + 8)
-                self.button(d, (x, box[3] - 36, x + bw, box[3] - 8), bid, label, style)
+                x = u(18) + i * (bw + gap)
+                self.button(d, (x, box[3] - u(8) - bh, x + bw, box[3] - u(8)), bid, label, style)
+
+    def wrap_chars(self, small=False):
+        """How many characters of message text fit across the overlay."""
+        f = self.F.small if small else self.F.msg
+        return max(20, int((self.W - self.L.u(36)) / f.getlength("M")))
+
+    def startup_y(self):
+        """Top of the start-up list (the rule above its title)."""
+        return self.H - self.L.u(106)
 
     def draw_startup(self):
-        C = self.C
+        C, L, F, W, H = self.C, self.L, self.F, self.W, self.H
+        u = L.u
         img = Image.new("RGB", (W, H), C["bg"])
         d = ImageDraw.Draw(img)
-        for y in range(0, H, 6):
+        for y in range(0, H, u(6)):
             d.line((0, y, W, y), fill=C["scan"])
+        top = self.startup_y()
         if self.logo:
-            img.paste(self.logo, ((W - self.logo.width) // 2, 6), self.logo)
-        d.line((10, 134, W - 10, 134), fill=C["purple_dim"])
-        d.text((10, 138), "BD-1 // SYSTEM START", font=Fonts.head, fill=C["lavender"])
+            # centred in the space above the list
+            img.paste(self.logo, ((W - self.logo.width) // 2, max(u(6), (top - self.logo.height) // 2)), self.logo)
+        d.line((u(10), top, W - u(10), top), fill=C["purple_dim"])
+        d.text((u(10), top + u(4)), "BD-1 // SYSTEM START", font=F.head, fill=C["lavender"])
         steps = self.startup_steps()
-        y = 156
+        y = top + u(22)
+        dot_w = F.mono.getlength(".")
         for label, value, colour in steps:
-            d.text((10, y), label, font=Fonts.mono, fill=C["grey"])
-            d.text((10 + 7 * len(label), y), "." * (22 - len(label)), font=Fonts.mono, fill=hexrgb("#32323c"))
-            d.text((W - 10, y), value, font=Fonts.mono_b, fill=colour, anchor="ra")
-            y += 13
+            d.text((u(10), y), label, font=F.mono, fill=C["grey"])
+            x = u(10) + F.mono.getlength(label + " ")
+            room = W - u(10) - F.mono_b.getlength(value + " ") - x
+            d.text((x, y), "." * max(0, int(room / dot_w)), font=F.mono, fill=hexrgb("#32323c"))
+            d.text((W - u(10), y), value, font=F.mono_b, fill=colour, anchor="ra")
+            y += u(13)
         done = sum(1 for _, _, c in steps if c != C["faint"] and c != C["purple"])
-        d.rectangle((10, 222, W - 10, 232), outline=C["purple_dim"])
-        d.rectangle((12, 224, 12 + int((W - 24) * done / len(steps)), 230), fill=C["purple"])
+        d.rectangle((u(10), H - u(18), W - u(10), H - u(8)), outline=C["purple_dim"])
+        d.rectangle((u(12), H - u(16), u(12) + int((W - u(24)) * done / len(steps)), H - u(10)), fill=C["purple"])
         return img, done == len(steps)
 
     def startup_steps(self):
@@ -547,10 +731,16 @@ class Panel:
         if self.confirm and time.monotonic() > self.confirm[1]:
             self.confirm = None
         flash_on = int(time.time() / self.cfg["flash_s"]) % 2 == 0
-        img, d = self.frame(self.tab, self.alerts(), flash_on)
+        title = {"menu": "MENU", "screen": "SCREEN"}.get(self.page, self.tab)
+        img, d = self.frame(title, self.alerts(), flash_on, tabs=self.page == "sync")
         if self.overlay:
-            self.hits = [h for h in self.hits if not h[1].startswith("tab:")] if self.overlay["kind"] == "busy" else self.hits
+            if self.overlay["kind"] == "busy":
+                self.hits = []              # nothing to tap while a job runs
             self.draw_overlay(d)
+        elif self.page == "menu":
+            self.draw_menu(d)
+        elif self.page == "screen":
+            self.draw_screen(d)
         else:
             {"SYSTEM": self.draw_system, "NETWORK": self.draw_network,
              "COMPANION": self.draw_companion, "SYNC": self.draw_sync}[self.tab](d)
@@ -571,6 +761,15 @@ class Panel:
         if hit is None:
             self.confirm = None
             return
+        if hit == "menu":
+            self.page = "menu"
+            self.overlay = None
+            self.confirm = None
+            return
+        if hit.startswith("page:"):
+            self.page = hit[5:]
+            self.confirm = None
+            return
         if hit.startswith("tab:"):
             self.tab = hit[4:]
             self.overlay = None
@@ -580,18 +779,22 @@ class Panel:
             self.overlay = None
             self.confirm = None
             return
-        if hit in NEEDS_CONFIRM and not (self.confirm and self.confirm[0] == hit):
+        needs = hit in NEEDS_CONFIRM or hit.startswith("rot:")
+        if needs and not (self.confirm and self.confirm[0] == hit):
             self.confirm = (hit, time.monotonic() + self.cfg["confirm_s"])
             return
         self.confirm = None
+        if hit.startswith("rot:"):
+            self.set_rotation(int(hit[4:]))
+            return
         self.start_action(hit)
 
     # ---- actions ---------------------------------------------------------------
     def busy(self, title, *lines):
-        self.overlay = {"kind": "busy", "title": title, "lines": wrap(lines)}
+        self.overlay = {"kind": "busy", "title": title, "lines": list(lines)}
 
     def message(self, title, *lines, buttons=None, colour=None, small=False):
-        self.overlay = {"kind": "message", "title": title, "lines": wrap(lines, 50 if small else 44),
+        self.overlay = {"kind": "message", "title": title, "lines": list(lines),
                         "buttons": buttons or [("OK", "close", "purple")], "colour": colour, "small": small}
 
     def start_action(self, bid):
@@ -790,6 +993,10 @@ class Panel:
         self.start_pollers()
         next_frame = 0.0
         while not self.stopping:
+            if self.calibrating:
+                time.sleep(0.05)
+                next_frame = 0.0
+                continue
             tap = self.hw.tap()
             now = time.monotonic()
             if tap:
@@ -802,19 +1009,110 @@ class Panel:
 
     def goodbye(self):
         C = self.C
+        W, H, u = self.W, self.H, self.L.u
         img = Image.new("RGB", (W, H), C["bg"])
         d = ImageDraw.Draw(img)
         if self.logo:
-            img.paste(self.logo, ((W - self.logo.width) // 2, 30), self.logo)
+            img.paste(self.logo, ((W - self.logo.width) // 2, max(u(6), (self.startup_y() - self.logo.height) // 2)),
+                      self.logo)
         try:      # is-system-running exits non-zero unless 'running', so read its output regardless
             state = subprocess.run(["systemctl", "is-system-running"], capture_output=True,
                                    text=True, timeout=5).stdout.strip()
         except Exception:
             state = ""
         text = "PANEL RESTARTING" if state in ("running", "degraded") else "BD-1 // OFFLINE"
-        d.text((W // 2, 190), text, font=Fonts.head, fill=C["lavender"], anchor="mm")
+        d.text((W // 2, H - u(50)), text, font=self.F.head, fill=C["lavender"], anchor="mm")
         self.hw.frame = None
         self.hw.show(img)
+
+
+def draw_picked(cfg, size, name):
+    """Confirmation after a tap on the chooser."""
+    w, h = size
+    L = Layout(w, h)
+    C = {k: hexrgb(v) for k, v in cfg["colours"].items()}
+    img = Image.new("RGB", size, C["bg"])
+    d = ImageDraw.Draw(img)
+    d.text((w // 2, h // 2 - L.u(14)), f'{name}" SCREEN', font=Fonts(L.k * 1.8).head, fill=C["green"], anchor="mm")
+    d.text((w // 2, h // 2 + L.u(18)), "SELECTED", font=Fonts(L.k).btn, fill=C["green"], anchor="mm")
+    return img
+
+
+def draw_choice(cfg, size, name, current, left):
+    """The chooser's picture for one screen type."""
+    w, h = size
+    L = Layout(w, h)
+    F = Fonts(L.k)
+    u = L.u
+    C = {k: hexrgb(v) for k, v in cfg["colours"].items()}
+    img = Image.new("RGB", size, C["bg"])
+    d = ImageDraw.Draw(img)
+    for y in range(0, h, u(6)):
+        d.line((0, y, w, y), fill=C["scan"])
+    d.text((w // 2, h // 2 - u(36)), f'{name}" SCREEN', font=Fonts(L.k * 1.8).head, fill=C["lavender"], anchor="mm")
+    d.text((w // 2, h // 2 + u(4)), "TAP ANYWHERE TO USE THIS SCREEN", font=F.btn, fill=C["purple"], anchor="mm")
+    note = (f'CARRYING ON WITH THE {current}" IN {left} S' if left > 0 else f'CARRYING ON WITH THE {current}"')
+    d.text((w // 2, h // 2 + u(26)), note, font=F.mono, fill=C["grey"], anchor="mm")
+    return img
+
+
+def choose_screen(cfg):
+    """At power-on, offer each screen type in turn: whichever screen is fitted
+    shows its own turn clearly (the other turn looks blank or scrambled), and a
+    tap during it picks that type. No tap: the current setting. Returns the
+    screen name to use."""
+    import hw as HW
+    total, turn = cfg.get("screen_choice_s", 0), cfg.get("screen_choice_turn_s", 3)
+    current = HW.screen_name(cfg)
+    if not total:
+        return current
+    order = [current] + [n for n in HW.SCREENS if n != current]
+    end = time.monotonic() + total
+    i = 0
+    while time.monotonic() < end:
+        name = order[i % len(order)]
+        i += 1
+        try:
+            dev = HW.Hardware({**cfg, "screen": name})
+        except Exception:
+            log.exception("screen chooser: couldn't start the %s\" driver", name)
+            continue
+        try:
+            started = time.monotonic()
+            while time.monotonic() - started < turn and time.monotonic() < end:
+                left = max(0, int(end - time.monotonic()))
+                dev.frame = None
+                dev.show(draw_choice(cfg, (dev.W, dev.H), name, current, left))
+                # ignore a tap in the first moments of a turn: it may have been
+                # meant for the turn before
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < 1.0:
+                    if time.monotonic() - started > 0.7 and dev.pressed():
+                        log.info("screen chooser: %s\" picked", name)
+                        dev.frame = None
+                        dev.show(draw_picked(cfg, (dev.W, dev.H), name))
+                        time.sleep(1.5)
+                        let_go = time.monotonic() + 3      # never wait for ever on a stuck touch
+                        while dev.pressed() and time.monotonic() < let_go:
+                            time.sleep(0.02)
+                        return name
+                    time.sleep(0.02)
+        finally:
+            dev.close()
+    return current
+
+
+def save_setting(key, value):
+    """Change one setting in panel.json, keeping everything else."""
+    try:
+        with open(SETTINGS_FILE) as f:
+            mine = json.load(f)
+    except (OSError, ValueError):
+        mine = {}
+    mine[key] = value
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(mine, f, indent=2)
 
 
 def wrap(lines, width=44):
@@ -827,14 +1125,27 @@ def wrap(lines, width=44):
 def main(argv):
     cfg = load_settings()
     if argv[:1] == ["--preview"]:
+        from hw import screen_size
         from preview import render_samples
-        render_samples(Panel, cfg, argv[1] if len(argv) > 1 else "preview")
+        out = argv[1] if len(argv) > 1 else "preview"
+        for screen in ("2.4", "3.5"):
+            for rot, shape in ((0, "landscape"), (90, "portrait")):
+                size = screen_size({**cfg, "screen": screen, "rotation": rot})
+                render_samples(Panel, cfg, os.path.join(out, f"{screen}-{shape}"), size)
         return 0
     log_file = os.path.expanduser(cfg["log_file"])
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
                         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)])
     from hw import Hardware
+    # the screen chooser only at power-on, not when just the panel restarts
+    up = info.system().get("uptime")
+    if cfg.get("screen_choice_s") and up is not None and up < 300:
+        picked = choose_screen(cfg)
+        if picked != str(cfg.get("screen", "2.4")):
+            save_setting("screen", picked)
+            cfg["screen"] = picked
+            log.info("screen set to %s\" at start-up", picked)
     hw = Hardware(cfg)
     s = E.default_settings(log=log.info)
     panel = Panel(cfg, hw, s)

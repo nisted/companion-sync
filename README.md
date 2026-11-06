@@ -99,7 +99,9 @@ Pi commands: `companion-sync status | take | save | return | setup | unlock | en
 - `engine.py`: all the sync logic and storage back-ends; on the Pi it's also the `companion-sync` command.
 - `app.py`: the Windows / Mac / Pi desktop tray app (on the Pi: zenity dialogs, AppIndicator icon).
 - `popup.py`: the pop-up window (tkinter, its own process); `web.py`: the web GUI and its local API.
-- `panel/`: an optional 2.4" SPI touchscreen panel for the Pi (`install.sh --panel`).
+- `panel/`: an optional SPI touchscreen panel for the Pi (`install.sh --panel`): the 2.4" or the 3.5",
+  picked by the `screen` setting (or tapped on the chooser offered at power-on), with rotation and the
+  menu set from the panel's SCREEN page.
 - `pi/`: the Pi services (start-up take before Companion or Docker, 15-minute saves), `install.sh` and
   `settings.example.json`.
 - `tests/`: scenario tests against a local folder, rclone and a fake GitHub: `python3 tests/test_engine.py`.

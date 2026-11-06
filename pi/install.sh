@@ -6,7 +6,8 @@
 #   sudo ./pi/install.sh              install or update from this unpacked folder
 #   sudo ./pi/install.sh --headless   no tray icon, even on a Pi with a desktop
 #   sudo ./pi/install.sh --tray       add the tray icon (e.g. to undo --headless)
-#   sudo ./pi/install.sh --panel      also set up the 2.4" SPI touchscreen panel
+#   sudo ./pi/install.sh --panel      also set up the SPI touchscreen panel (2.4" or 3.5", picked by
+#                                     the "screen" setting; rotation and menu on the panel's SCREEN page)
 #
 # Companion can be CompanionPi's service, the desktop app or a Docker
 # container: it's detected, or set in ~/.config/companion-sync/settings.json

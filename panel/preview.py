@@ -17,9 +17,9 @@ SAMPLE = {
 }
 
 
-def render_samples(Panel, cfg, out):
+def render_samples(Panel, cfg, out, size=(320, 240)):
     os.makedirs(out, exist_ok=True)
-    p = Panel(cfg, Preview(out), settings=None, live=False)
+    p = Panel(cfg, Preview(out, size=size), settings=None, live=False)
     p.data = {k: (dict(v) if isinstance(v, dict) else v) for k, v in SAMPLE.items()}
     p.data["sync"]["last_save"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 660))
 
@@ -29,6 +29,15 @@ def render_samples(Panel, cfg, out):
     for t in ("SYSTEM", "NETWORK", "COMPANION", "SYNC"):
         p.tab = t
         shot(t.lower())
+    # menu and screen pages
+    p.page = "menu"
+    shot("menu")
+    p.page = "screen"
+    shot("screen")
+    p.confirm = ("rot:90", time.monotonic() + 5)
+    shot("screen-confirm")
+    p.confirm = None
+    p.page = "sync"
     # tap-again confirm on SHUTDOWN and RETURN
     p.tab = "SYSTEM"
     p.confirm = ("shutdown", time.monotonic() + 5)
