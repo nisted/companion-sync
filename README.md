@@ -82,6 +82,13 @@ just needs mounting; Google Drive, Dropbox and OneDrive give a command to run on
 whose result you paste back. The user needs passwordless sudo (the Pi's normal first user has it).
 Pi commands: `companion-sync status | take | save | return | setup | unlock | encryption on|off`.
 
+## RebelDeck
+
+If [RebelDeck](https://github.com/nisted/RebelDeck) is installed, the tray menu gets a **RebelDeck** item: show or
+hide its decks, open its web GUI, and install its updates. If RebelDeck's *Let my decks travel between rigs with
+Companion Sync* is on, deck layouts are saved with the config (`REBELDECK.json` next to `LOCK`) and come back on
+Take.
+
 ## Features
 
 - **Choice of storage**, changeable later: from the rig that has the config, **Storage…** moves it (and its

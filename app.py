@@ -51,6 +51,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 import engine as E
+import rebeldeck_link as RD
 from icon import draw_cs
 
 APP = "Companion Sync"
@@ -602,9 +603,45 @@ class App:
             M("Open Companion", self.bg(self.open_companion)),
             M("Take config", self.bg(self.take_only), enabled=lambda i: not self.mine),
             M("Launch GUI", lambda: self.launch_gui()),
+            M("RebelDeck", pystray.Menu(self.rebeldeck_items), visible=lambda i: RD.installed()),
             pystray.Menu.SEPARATOR,
             M(f"Quit {APP}", self.quit),
         )
+
+    def rebeldeck_items(self):
+        """The RebelDeck submenu: its decks, its web GUI and its updates
+        (it's a separate app; see rebeldeck_link)."""
+        M = pystray.MenuItem
+        st = RD.status()
+        if not st:
+            yield M("RebelDeck isn't running", None, enabled=False)
+            return
+        yield M(f"RebelDeck: {st.get('status', '?')}", None, enabled=False)
+        def toggle(k, on):
+            return lambda: self._rd(lambda: RD.set_showing(k, not on))
+
+        def ticked(on):
+            return lambda item: on
+        for d in st.get("decks", []):
+            yield M(f"{d['name']} ({d['columns']}×{d['rows']})", toggle(d["id"], d["showing"]),
+                    checked=ticked(d["showing"]))
+        yield pystray.Menu.SEPARATOR
+        yield M("Open RebelDeck GUI", lambda: webbrowser.open(RD.gui_url()))
+        up = st.get("update") or {}
+        if up.get("newer"):
+            yield M(f"Update RebelDeck to {up.get('latest')}", lambda: self._rd(RD.update_now))
+
+    def _rd(self, fn):
+        def go():
+            try:
+                fn()
+            except Exception as e:
+                self.notify(f"RebelDeck didn't answer: {e}")
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+        threading.Thread(target=go, daemon=True).start()
 
     def bg(self, fn, web=False):
         """Run a menu action in the background so the menu never freezes.

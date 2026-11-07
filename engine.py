@@ -2205,6 +2205,7 @@ def _take(s, confirm_takeover=None, manage_companion=True):
         _step(s, 4, N, "Copying modules this rig doesn't have")
         _modules_step(s, download_modules, "added to this rig")
         _step(s, 5, N, f"Locking the config to {s.rig}")
+        _rebeldeck_take(s)
     except Cancelled:
         if safety:                             # put this rig's own config back
             restore_safety_copy(s, dv, safety)
@@ -2216,6 +2217,28 @@ def _take(s, confirm_takeover=None, manage_companion=True):
     mark_holding(s, True)
     record_ok(s, "take")
     return f"{s.rig} now has the config."
+
+
+def _rebeldeck_save(s):
+    """RebelDeck's deck layouts go with the config, if it asks (see rebeldeck_link)."""
+    try:
+        import rebeldeck_link as RD
+        text = RD.decks_to_store()
+        if text:
+            s.store.write(RD.STORE_FILE, text)
+    except Exception as e:                      # never stops a save
+        s.log(f"RebelDeck decks not saved: {e}")
+
+
+def _rebeldeck_take(s):
+    try:
+        import rebeldeck_link as RD
+        if RD.syncing():
+            line = RD.apply_stored(s.store.read(RD.STORE_FILE))
+            if line:
+                s.log(line)
+    except Exception as e:
+        s.log(f"RebelDeck decks not taken: {e}")
 
 
 def save(s, quiet=False):
@@ -2252,6 +2275,7 @@ def _save(s, quiet=False):
     _step(s, 2, 3, "Uploading new modules")
     _modules_step(s, upload_modules, "uploaded")
     _step(s, 3, 3, "Refreshing the lock")
+    _rebeldeck_save(s)
     write_lock(s, taken_time(h))
     mark_holding(s, True)
     record_ok(s, "save")
