@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))          # engine.py lives one level up
 import engine as E                                  # noqa: E402
 import info                                         # noqa: E402
+from deckview import DeckView, fit as deck_fit      # noqa: E402
 
 DEFAULTS = {
     # screen: "2.4" (SHCHV 2.4", 320x240) or "3.5" (3.5" RPi Display, 480x320).
@@ -185,7 +186,8 @@ class Panel:
         self.C = {k: hexrgb(v) for k, v in cfg["colours"].items()}
         self.s = settings
         self.tab = "SYSTEM"
-        self.page = "sync"                  # sync (the four tabs) | menu | screen
+        self.page = "sync"                  # sync (the four tabs) | menu | screen | rebeldeck
+        self.deck = DeckView(cfg) if live else None
         self.calibrating = False
         self.data = {"system": {}, "network": {}, "companion": {}, "sync": {}, "latest": None,
                      "boot": None}
@@ -547,13 +549,66 @@ class Panel:
         """What the panel shows. Tap the title block to come back here."""
         L, W, H, u = self.L, self.W, self.H, self.L.u
         entries = [("page:sync", "COMPANION SYNC", "purple", True),
-                   ("page:rebeldeck", "REBELDECK  (COMING)", "purple", False),
+                   ("page:rebeldeck", "REBELDECK", "purple", True),
                    ("page:screen", "SCREEN", "cyan", True)]
         top, bottom, gap = L.top + u(6), H - u(10), u(8)
         bh = (bottom - top - gap * (len(entries) - 1)) / len(entries)
         for i, (bid, label, style, on) in enumerate(entries):
             y = top + i * (bh + gap)
             self.button(d, (u(10), int(y), W - u(10), int(y + bh)), bid, label, style, enabled=on)
+
+    def deck_area(self):
+        """Where the deck's buttons go: below the header's tap area, to the bottom."""
+        u = self.L.u
+        return u(6), u(34), self.W - u(6), self.H - u(6)
+
+    def draw_deck(self, img, d):
+        """A RebelDeck deck (see deckview.py)."""
+        C, F, u = self.C, self.F, self.L.u
+        x0, y0, x1, y1 = self.deck_area()
+        dv = self.deck
+        if dv is None:
+            return
+        dv.show(True, deck_fit(x1 - x0, y1 - y0, self.L.k))
+        with dv.lock:
+            cols, rows, keys = dv.cols, dv.rows, dict(dv.keys)
+        if not cols or dv.status in ("not running", "not installed", "no deck", "starting") and not keys:
+            lines = {"not installed": ["REBELDECK ISN'T INSTALLED", "github.com/nisted/RebelDeck",
+                                       "sudo rebeldeck/pi/install.sh --headless"],
+                     "not running": ["REBELDECK ISN'T RUNNING", "sudo systemctl start rebeldeck"],
+                     "no deck": ["NO DECK CALLED", f'"{dv.problem}"', "CHECK rebeldeck_deck IN panel.json"]}.get(
+                dv.status, ["LOOKING FOR REBELDECK..."])
+            cy = (y0 + y1) // 2 - u(12) * (len(lines) - 1) // 2
+            for i, line in enumerate(lines):
+                d.text((self.W // 2, cy + i * u(24)), line, font=F.btn if i == 0 else F.mono,
+                       fill=C["lavender"] if i == 0 else C["grey"], anchor="mm")
+            return
+        gap = u(4)
+        side = int(min((x1 - x0 - gap * (cols - 1)) / cols, (y1 - y0 - gap * (rows - 1)) / rows))
+        ox = x0 + (x1 - x0 - (side * cols + gap * (cols - 1))) // 2
+        oy = y0 + (y1 - y0 - (side * rows + gap * (rows - 1))) // 2
+        for i in range(cols * rows):
+            bx, by = ox + (i % cols) * (side + gap), oy + (i // cols) * (side + gap)
+            box = (bx, by, bx + side - 1, by + side - 1)
+            k = keys.get(i)
+            pic = dv.image(i, (side, side)) if k else None
+            if pic is not None:
+                img.paste(pic, (bx, by))
+            else:
+                d.rectangle(box, fill=k["color"] if k else C["bg"], outline=C["rule"])
+                if k and k["text"]:
+                    d.multiline_text(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), k["text"][:24],
+                                     font=F.btn_s, fill=k["text_color"], anchor="mm", align="center")
+            if dv.held == i:
+                d.rectangle(box, outline=C["lavender"], width=max(1, u(2)))
+            self.hits.append((box, f"key:{i}"))
+        if dv.status != "connected":
+            msg = "WAITING FOR COMPANION" if dv.status in ("connecting", "disconnected", "refused") else \
+                "LOST REBELDECK" if dv.status == "lost" else dv.status.upper()
+            w = F.btn.getlength(msg) + u(20)
+            cx, cy = self.W // 2, (y0 + y1) // 2
+            d.rectangle((cx - w // 2, cy - u(14), cx + w // 2, cy + u(14)), fill=C["bg"], outline=C["red"])
+            d.text((cx, cy), msg, font=F.btn, fill=C["red"], anchor="mm")
 
     def draw_screen(self, d):
         """Screen settings: rotation and touch calibration."""
@@ -731,7 +786,7 @@ class Panel:
         if self.confirm and time.monotonic() > self.confirm[1]:
             self.confirm = None
         flash_on = int(time.time() / self.cfg["flash_s"]) % 2 == 0
-        title = {"menu": "MENU", "screen": "SCREEN"}.get(self.page, self.tab)
+        title = {"menu": "MENU", "screen": "SCREEN", "rebeldeck": "REBELDECK"}.get(self.page, self.tab)
         img, d = self.frame(title, self.alerts(), flash_on, tabs=self.page == "sync")
         if self.overlay:
             if self.overlay["kind"] == "busy":
@@ -741,6 +796,8 @@ class Panel:
             self.draw_menu(d)
         elif self.page == "screen":
             self.draw_screen(d)
+        elif self.page == "rebeldeck":
+            self.draw_deck(img, d)
         else:
             {"SYSTEM": self.draw_system, "NETWORK": self.draw_network,
              "COMPANION": self.draw_companion, "SYNC": self.draw_sync}[self.tab](d)
@@ -762,9 +819,15 @@ class Panel:
             self.confirm = None
             return
         if hit == "menu":
+            if self.deck:
+                self.deck.show(False)
             self.page = "menu"
             self.overlay = None
             self.confirm = None
+            return
+        if hit.startswith("key:"):
+            if self.deck:
+                self.deck.press(int(hit[4:]), True)
             return
         if hit.startswith("page:"):
             self.page = hit[5:]
@@ -1002,6 +1065,13 @@ class Panel:
             if tap:
                 self.on_tap(*tap)
                 next_frame = 0.0
+            if self.deck and self.page == "rebeldeck":
+                if self.deck.held is not None and not self.hw.pressed():
+                    self.deck.press(None, False)            # finger lifted: let the button go
+                    next_frame = 0.0
+                if self.deck.changed.is_set():
+                    self.deck.changed.clear()
+                    next_frame = 0.0
             if now >= next_frame:
                 self.hw.show(self.render())
                 next_frame = now + self.cfg["frame_s"]

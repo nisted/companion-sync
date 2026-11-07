@@ -339,5 +339,8 @@ class Preview:
     def tap(self):
         return self.taps.pop(0) if self.taps else None
 
+    def pressed(self):
+        return getattr(self, "down", False)
+
     def close(self):
         pass
