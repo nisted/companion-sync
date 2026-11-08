@@ -681,12 +681,12 @@ def t_lost_claim_installs_nothing(w):
     a, b = w.rigs["alpha"], w.rigs["bravo"]
     E.return_(a)
     make_config(b.base, value="b")
-    real_sleep = E.time.sleep
-    E.time.sleep = lambda t: E.write_lock(a, E.now())                  # alpha locks it meanwhile
+    real_sleep = E._claim_sleep
+    E._claim_sleep = lambda t: E.write_lock(a, E.now())                # alpha locks it meanwhile
     try:
         expect_error(lambda: E.take(b), "took the config")
     finally:
-        E.time.sleep = real_sleep
+        E._claim_sleep = real_sleep
     assert read_value(b.base) == "b"
     assert E.holder_name(E.lock_holder(b)) == "alpha"
 

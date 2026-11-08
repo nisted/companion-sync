@@ -1991,6 +1991,7 @@ def write_lock(s, taken):
 CLAIM_WAIT = {"nas": 1.5, "github": 3, "gdrive": 4, "dropbox": 4, "onedrive": 4, "icloud": 12}
 CLAIM_STALE_HOURS = 10 / 60          # a claim left behind by a rig that died mid-claim
 CLAIM_TRIES = 6
+_claim_sleep = time.sleep            # (tests stand in here)
 
 
 def _claim_wait(s):
@@ -2020,7 +2021,7 @@ def claim_lock(s, before):
         _stop_if_cancelled(s)
         s.store.write(me, f"{s.rig} claims the config {now()} {random.random():.6f}\n")
         try:
-            time.sleep(wait)
+            _claim_sleep(wait)
             h = lock_holder(s)
             if (h or None) != (before or None) and holder_name(h) != s.rig:
                 raise SyncError(f"{holder_name(h)} took the config a moment before this rig did.")
@@ -2030,12 +2031,14 @@ def claim_lock(s, before):
         finally:
             with contextlib.suppress(Exception):
                 s.store.delete(me)
-        time.sleep(random.uniform(wait, 3 * wait))           # someone else is claiming too
+        _claim_sleep(random.uniform(wait, 3 * wait))          # someone else is claiming too
     raise SyncError("Another rig kept trying to take the config at the same moment. Try again.")
 
 
 def release_lock(s, before):
     """Put the lock back as it was before a take that didn't finish."""
+    if s.cancel is not None:
+        s.cancel.clear()                 # a pressed Cancel mustn't stop the lock going back
     with contextlib.suppress(Exception):
         if holder_name(lock_holder(s)) == s.rig:
             if before:
