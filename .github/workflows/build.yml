@@ -1,4 +1,4 @@
-name: Build Companion Sync
+name: Build Rebel Sync
 
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
           python build/write_client.py
           python icon.py
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name "Companion Sync" --icon icon.png --hidden-import pystray._win32 --hidden-import web --hidden-import popup --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
+        run: pyinstaller --noconfirm --onefile --windowed --name "Rebel Sync" --icon icon.png --hidden-import pystray._win32 --hidden-import web --hidden-import popup --add-binary "rclone.exe;." --add-data "logo-source.png;." app.py
       - name: Installer
         shell: pwsh
         run: |
@@ -37,14 +37,14 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
           $ver = (Get-Content VERSION).Trim()
-          & $iscc "/DBuild=${{ github.run_number }}" "/DVersion=$ver" build\companion-sync.iss
+          & $iscc "/DBuild=${{ github.run_number }}" "/DVersion=$ver" build\rebel-sync.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
-          name: Companion-Sync-Windows
+          name: Rebel-Sync-Windows
           path: |
-            dist/Companion Sync.exe
-            dist/Companion-Sync-Setup.exe
+            dist/Rebel Sync.exe
+            dist/Rebel-Sync-Setup.exe
 
   mac:
     runs-on: macos-latest          # Apple silicon Macs
@@ -67,27 +67,41 @@ jobs:
           python icon.py
       - name: Build
         run: |
-          pyinstaller --noconfirm --windowed --name "Companion Sync" --icon icon.png \
-            --osx-bundle-identifier uk.co.nigelisted.companionsync \
+          pyinstaller --noconfirm --windowed --name "Rebel Sync" --icon icon.png \
+            --osx-bundle-identifier uk.co.nigelisted.rebelsync \
             --hidden-import pystray._darwin --hidden-import web --hidden-import popup --add-binary "rclone:." --add-data "logo-source.png:." app.py
           # menu-bar only: no Dock icon
-          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Companion Sync.app/Contents/Info.plist"
-          plist="dist/Companion Sync.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "dist/Rebel Sync.app/Contents/Info.plist"
+          plist="dist/Rebel Sync.app/Contents/Info.plist"
           for kv in "CFBundleShortVersionString $(cat VERSION)" "CFBundleVersion ${{ github.run_number }}"; do
             set -- $kv
             /usr/libexec/PlistBuddy -c "Set :$1 $2" "$plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$plist"
           done
-          codesign --force --deep -s - "dist/Companion Sync.app"
-          ditto -c -k --keepParent "dist/Companion Sync.app" Companion-Sync-Mac.zip
+          codesign --force --deep -s - "dist/Rebel Sync.app"
+          ditto -c -k --keepParent "dist/Rebel Sync.app" Rebel-Sync-Mac.zip
+          # for Macs still on Companion Sync: their updater looks for "Companion Sync.app";
+          # the new app renames itself to Rebel Sync.app when it first opens
+          mkdir legacy && ditto "dist/Rebel Sync.app" "legacy/Companion Sync.app"
+          ditto -c -k --keepParent "legacy/Companion Sync.app" Companion-Sync-Mac.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: Companion-Sync-Mac
-          path: Companion-Sync-Mac.zip
+          name: Rebel-Sync-Mac
+          path: |
+            Rebel-Sync-Mac.zip
+            Companion-Sync-Mac.zip
 
   pi:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Engine tests (folder, rclone as for Google Drive, GitHub); a failure stops the release
+        run: |
+          pip install cryptography
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          python tests/test_engine.py
       - name: Google sign-in details
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -95,18 +109,24 @@ jobs:
         run: python3 build/write_client.py
       - name: Package for the Pi
         run: |
-          mkdir -p pkg/companion-sync
-          cp -r engine.py app.py web.py popup.py icon.py rebeldeck_link.py logo-source.png _client.py VERSION panel pi pkg/companion-sync/
-          echo "${{ github.run_number }}" > pkg/companion-sync/BUILD
+          mkdir -p pkg/rebel-sync
+          cp -r engine.py app.py web.py popup.py icon.py trayfix.py rebeldeck_link.py logo-source.png _client.py VERSION panel pi pkg/rebel-sync/
+          echo "${{ github.run_number }}" > pkg/rebel-sync/BUILD
           find pkg -name __pycache__ -prune -exec rm -rf {} +
-          tar czf Companion-Sync-Pi.tar.gz -C pkg companion-sync
+          tar czf Rebel-Sync-Pi.tar.gz -C pkg rebel-sync
+          # for Pis still on Companion Sync: their updater unpacks "companion-sync/pi/install.sh"
+          mkdir legacy && cp -r pkg/rebel-sync legacy/companion-sync
+          tar czf Companion-Sync-Pi.tar.gz -C legacy companion-sync
       - uses: actions/upload-artifact@v4
         with:
-          name: Companion-Sync-Pi
-          path: Companion-Sync-Pi.tar.gz
+          name: Rebel-Sync-Pi
+          path: |
+            Rebel-Sync-Pi.tar.gz
+            Companion-Sync-Pi.tar.gz
 
   # Publish each build from main as the latest release: the app's
-  # "Update Companion Sync" menu item downloads and installs it from here.
+  # "Update Rebel Sync" menu item downloads and installs it from here. The
+  # Companion-Sync-* copies let rigs still on Companion Sync update to it.
   release:
     if: github.ref == 'refs/heads/main'
     needs: [windows, mac, pi]
@@ -122,12 +142,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp "out/Companion-Sync-Windows/Companion Sync.exe" Companion-Sync-Windows.exe
-          cp out/Companion-Sync-Windows/Companion-Sync-Setup.exe Companion-Sync-Setup.exe
-          cp out/Companion-Sync-Mac/Companion-Sync-Mac.zip Companion-Sync-Mac.zip
-          cp out/Companion-Sync-Pi/Companion-Sync-Pi.tar.gz Companion-Sync-Pi.tar.gz
+          cp "out/Rebel-Sync-Windows/Rebel Sync.exe" Rebel-Sync-Windows.exe
+          cp out/Rebel-Sync-Windows/Rebel-Sync-Setup.exe Rebel-Sync-Setup.exe
+          cp out/Rebel-Sync-Windows/Rebel-Sync-Setup.exe Companion-Sync-Setup.exe
+          cp out/Rebel-Sync-Mac/Rebel-Sync-Mac.zip out/Rebel-Sync-Mac/Companion-Sync-Mac.zip .
+          cp out/Rebel-Sync-Pi/Rebel-Sync-Pi.tar.gz out/Rebel-Sync-Pi/Companion-Sync-Pi.tar.gz .
           gh release create "build-${{ github.run_number }}" \
-            Companion-Sync-Setup.exe Companion-Sync-Windows.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
+            Rebel-Sync-Setup.exe Rebel-Sync-Windows.exe Rebel-Sync-Mac.zip Rebel-Sync-Pi.tar.gz \
+            Companion-Sync-Setup.exe Companion-Sync-Mac.zip Companion-Sync-Pi.tar.gz \
             --repo "${{ github.repository }}" --latest \
-            --title "Companion Sync v$(cat VERSION) (build ${{ github.run_number }})" \
-            --notes "Built from ${{ github.sha }}"
+            --title "Rebel Sync v$(cat VERSION) (build ${{ github.run_number }})" \
+            --notes "Built from ${{ github.sha }}. Companion Sync is now Rebel Sync: the Companion-Sync-* files are for rigs updating from Companion Sync."

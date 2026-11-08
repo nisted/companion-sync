@@ -1,4 +1,4 @@
-"""Companion Sync's pop-up window (the approved mockup).
+"""Rebel Sync's pop-up window (the approved mockup).
 
 Runs as its own small process ('--popup <port>'), so it has its own main
 thread for tkinter on every platform (the Mac needs that, as the tray icon
@@ -30,7 +30,7 @@ def _scale():
     fonts come out smallest on the Mac), times popup_size % from Settings."""
     base = 1.45 if sys.platform == "darwin" else 1.2
     try:
-        with open(os.path.expanduser("~/.config/companion-sync/settings.json")) as f:
+        with open(os.path.expanduser("~/.config/rebel-sync/settings.json")) as f:
             pct = float(json.load(f).get("popup_size", 100))
     except (OSError, ValueError, TypeError, AttributeError):
         pct = 100
@@ -49,7 +49,7 @@ W = z(380)
 FONT = "Segoe UI" if sys.platform == "win32" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
 
 
-POS_FILE = os.path.expanduser("~/.config/companion-sync/popup-position.json")
+POS_FILE = os.path.expanduser("~/.config/rebel-sync/popup-position.json")
 
 
 def load_pos():
@@ -82,7 +82,7 @@ class Popup:
         self.misses = 0
         self.visible = None
         r = self.root = tk.Tk()
-        r.title("Companion Sync")
+        r.title("Rebel Sync")
         r.configure(bg=BG, highlightthickness=1, highlightbackground=PURPLE2, highlightcolor=PURPLE2)
         r.resizable(False, False)
         # No title bar and no taskbar button, like Companion's launcher window.
@@ -124,7 +124,7 @@ class Popup:
                 pass
         t = tk.Frame(head, bg=BG)
         t.pack(side="left")
-        tk.Label(t, text="Companion Sync", bg=BG, fg=TEXT, font=(FONT, z(16), "bold")).pack(anchor="w")
+        tk.Label(t, text="Rebel Sync", bg=BG, fg=TEXT, font=(FONT, z(16), "bold")).pack(anchor="w")
         self.sub = tk.Label(t, text="", bg=BG, fg=DIM, font=(FONT, z(10)))
         self.sub.pack(anchor="w")
 
@@ -424,7 +424,7 @@ def main(port, logo=None):
         # as this window is a copy of the same .exe and keeps it locked.
         import ctypes
         global _mutex
-        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "CompanionSyncRunning")
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "RebelSyncRunning")
     Popup(port, logo).run()
 
 

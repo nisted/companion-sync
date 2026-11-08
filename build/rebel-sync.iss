@@ -1,9 +1,11 @@
-; Companion Sync: Windows installer (Inno Setup 6), built by .github/workflows/build.yml
-;   iscc /DBuild=<run number> build\companion-sync.iss
+; Rebel Sync (formerly Companion Sync): Windows installer (Inno Setup 6), built by .github/workflows/build.yml
+;   iscc /DBuild=<run number> build\rebel-sync.iss
 ;
 ; Installs for the current user only (no admin prompt), always to the same
 ; folder, so Windows keeps the tray icon where you put it after updates.
-; The app's "Update Companion Sync..." runs this silently, then it reopens the app.
+; The app's "Update Rebel Sync..." runs this silently, then it reopens the app.
+; It also replaces a Companion Sync install (same AppId): the old folder, shortcuts
+; and login entry go, and Rebel Sync's take their place.
 
 #ifndef Build
   #define Build "dev"
@@ -11,8 +13,9 @@
 #ifndef Version
   #define Version "0.0.0"
 #endif
-#define AppName "Companion Sync"
-#define AppExe "Companion Sync.exe"
+#define AppName "Rebel Sync"
+#define AppExe "Rebel Sync.exe"
+#define OldName "Companion Sync"
 
 [Setup]
 AppId={{6B0C3E52-6F7A-4C1B-9E43-2B1D5A7C9F10}
@@ -21,14 +24,15 @@ AppVersion={#Version}
 AppVerName={#AppName} v{#Version} (build {#Build})
 VersionInfoVersion={#Version}
 AppPublisher=Nige Isted
-AppPublisherURL=https://github.com/nisted/companion-sync
+AppPublisherURL=https://github.com/nisted/rebel-sync
 DefaultDirName={autopf}\{#AppName}
+UsePreviousAppDir=no
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=Companion-Sync-Setup
+OutputBaseFilename=Rebel-Sync-Setup
 SetupIconFile=..\icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 WizardStyle=modern
@@ -40,6 +44,10 @@ RestartApplications=no
 [InstallDelete]
 ; old copies moved aside by earlier updates (see CurStepChanged)
 Type: files; Name: "{app}\*.old-*"
+; Companion Sync, the name before v2.0.0: its program folder and shortcuts
+Type: filesandordirs; Name: "{autopf}\{#OldName}"
+Type: files; Name: "{autoprograms}\{#OldName}.lnk"
+Type: files; Name: "{autodesktop}\{#OldName}.lnk"
 
 [UninstallDelete]
 ; everything in the install folder (incl. old copies), and the app's own rclone copy
@@ -59,6 +67,7 @@ Name: "desktopicon"; Description: "Add a desktop shortcut"; Flags: unchecked
 [Registry]
 ; the app's own "Start at login" entry: removed when uninstalled
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#AppName}"; Flags: uninsdeletevalue
+; the old name's entry: the app makes its new one when it starts (see migrate_app_names)
 
 [Run]
 ; also runs after a silent update, so the app comes back by itself
@@ -74,16 +83,16 @@ begin
   Result := True;
   if Silent then
     for i := 1 to 60 do begin              // up to 15 s for the app to quit
-      if not CheckForMutexes('CompanionSyncRunning') then
+      if not CheckForMutexes('RebelSyncRunning,CompanionSyncRunning') then
         Break;
       Sleep(250);
     end;
-  while CheckForMutexes('CompanionSyncRunning') do begin
+  while CheckForMutexes('RebelSyncRunning,CompanionSyncRunning') do begin
     if Silent then begin
       Result := False;
       Exit;
     end;
-    if MsgBox('Companion Sync is open. Quit it from its tray icon menu, then click OK.',
+    if MsgBox('Rebel Sync (or Companion Sync) is open. Quit it from its tray icon menu, then click OK.',
               mbInformation, MB_OKCANCEL) = IDCANCEL then begin
       Result := False;
       Exit;

@@ -1,4 +1,4 @@
-"""Companion Sync: system-tray (Windows, Raspberry Pi desktop) / menu-bar (Mac) app.
+"""Rebel Sync (formerly Companion Sync): system-tray (Windows, Raspberry Pi desktop) / menu-bar (Mac) app.
 
 Sits in the tray, shows who has the Companion config, and does the sync:
   - Open Companion: takes the config (if it can), then launches Companion
@@ -7,7 +7,7 @@ Sits in the tray, shows who has the Companion config, and does the sync:
   - returns the config automatically when Companion is quit
 All the real work is in engine.py, shared with the headless Pi command.
 
-On the Pi it runs from /opt/companion-sync (installed by pi/install.sh) and
+On the Pi it runs from /opt/rebel-sync (installed by pi/install.sh) and
 copes with Companion as the desktop app, CompanionPi's service or a Docker
 container. With a service or container, Open Companion opens its admin page,
 and the config isn't returned when Companion stops (the service is restarted
@@ -35,10 +35,14 @@ import json as _json
 def _rig_setting(key, default=None):
     """One value from this rig's settings.json, before the engine is loaded."""
     try:
-        with open(os.path.expanduser("~/.config/companion-sync/settings.json")) as f:
-            return _json.load(f).get(key, default)
+        for p in ("~/.config/rebel-sync/settings.json", "~/.config/companion-sync/settings.json"):
+            p = os.path.expanduser(p)
+            if os.path.exists(p):
+                with open(p) as f:
+                    return _json.load(f).get(key, default)
     except (OSError, ValueError, AttributeError):
-        return default
+        pass
+    return default
 
 
 # Pi: AppIndicator always opens the menu on a click. The GTK tray icon can tell
@@ -54,7 +58,8 @@ import engine as E
 import rebeldeck_link as RD
 from icon import draw_cs
 
-APP = "Companion Sync"
+APP = "Rebel Sync"
+OLD_APP = "Companion Sync"     # the name before v2.0.0 (moved over by migrate_app_names)
 SAVE_EVERY = 15 * 60        # seconds (save_every_min in settings.json changes it)
 GUI_PORT = 8090             # web GUI (gui_port in settings.json changes it)
 CHECK_EVERY = 30            # seconds between Companion / status checks
@@ -79,12 +84,13 @@ except ImportError:
 LABEL = f"v{VERSION} (build {BUILD})"       # what the pop-up, GUI and menu show
 
 LINUX = not E.WIN and not E.MAC
-RELEASES = "https://github.com/nisted/companion-sync/releases/latest"
-LATEST_API = "https://api.github.com/repos/nisted/companion-sync/releases/latest"
-UPDATE_ASSET = ("Companion-Sync-Setup.exe" if E.WIN else
-                "Companion-Sync-Mac.zip" if E.MAC else
-                "Companion-Sync-Pi.tar.gz")
-WIN_MUTEX = "CompanionSyncRunning"      # the Windows installer waits for this to go
+REPO = "nisted/rebel-sync"
+RELEASES = f"https://github.com/{REPO}/releases/latest"
+LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+UPDATE_ASSET = ("Rebel-Sync-Setup.exe" if E.WIN else
+                "Rebel-Sync-Mac.zip" if E.MAC else
+                "Rebel-Sync-Pi.tar.gz")
+WIN_MUTEX = "RebelSyncRunning"      # the Windows installer waits for this to go
 
 
 # A left click runs the menu's default item (Show/Hide window); a right click
@@ -122,11 +128,33 @@ if E.MAC and "--popup" not in sys.argv:
 
 # ---- places ------------------------------------------------------------------
 
+_old_data_moved = False
+
+
+def _old_data_dir():
+    if E.WIN:
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), OLD_APP)
+    if LINUX:
+        return os.path.expanduser("~/.config/companion-sync")
+    return os.path.expanduser(f"~/Library/Application Support/{OLD_APP}")
+
+
 def data_dir():
+    global _old_data_moved
+    if not _old_data_moved:                  # v2.0.0: Companion Sync's folder -> Rebel Sync's
+        _old_data_moved = True
+        E.migrate_local_names()
+        old = _old_data_dir()
+        new = old.replace(OLD_APP, APP).replace("companion-sync", "rebel-sync")
+        try:
+            if os.path.isdir(old) and not os.path.islink(old) and not os.path.exists(new):
+                os.replace(old, new)
+        except OSError:
+            pass
     if E.WIN:
         d = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
     elif LINUX:
-        d = os.path.expanduser("~/.config/companion-sync")
+        d = os.path.expanduser("~/.config/rebel-sync")
     else:
         d = os.path.expanduser(f"~/Library/Application Support/{APP}")
     os.makedirs(d, exist_ok=True)
@@ -162,12 +190,12 @@ def fetch(url, dest=None):
     """Download `url`: returns the bytes, or saves them to `dest`.
     The Mac uses curl, which trusts the system's certificates."""
     if E.MAC:
-        cmd = ["/usr/bin/curl", "-fsSL", "--max-time", "300", "-H", "User-Agent: companion-sync", url]
+        cmd = ["/usr/bin/curl", "-fsSL", "--max-time", "300", "-H", "User-Agent: rebel-sync", url]
         r = subprocess.run(cmd + (["-o", dest] if dest else []), capture_output=True)
         if r.returncode:
             raise OSError(r.stderr.decode(errors="replace").strip() or f"curl failed ({r.returncode})")
         return r.stdout
-    req = urllib.request.Request(url, headers={"User-Agent": "companion-sync"})
+    req = urllib.request.Request(url, headers={"User-Agent": "rebel-sync"})
     with urllib.request.urlopen(req, timeout=300) as r:
         if not dest:
             return r.read()
@@ -186,7 +214,7 @@ def child_env():
     return env
 
 
-LOG_FILE = os.path.join(data_dir(), "companion-sync.log")
+LOG_FILE = os.path.join(data_dir(), "rebel-sync.log")
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(APP)
@@ -426,26 +454,28 @@ def show_github_code(code, url):
     threading.Thread(target=say, daemon=True, args=(
         f"Your browser has opened GitHub's sign-in page:\n  {url}\n\n"
         f"Enter this code (it's already copied, so you can paste it):\n\n      {code}\n\n"
-        f"Then click Authorize. Companion Sync carries on by itself once you have.",)).start()
+        f"Then click Authorize. Rebel Sync carries on by itself once you have.",)).start()
 
 
 # ---- start at login ------------------------------------------------------------
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-PLIST = os.path.expanduser("~/Library/LaunchAgents/uk.co.nigelisted.companionsync.plist")
-AUTOSTART = os.path.expanduser("~/.config/autostart/companion-sync-tray.desktop")
+PLIST = os.path.expanduser("~/Library/LaunchAgents/uk.co.nigelisted.rebelsync.plist")
+OLD_PLIST = os.path.expanduser("~/Library/LaunchAgents/uk.co.nigelisted.companionsync.plist")
+AUTOSTART = os.path.expanduser("~/.config/autostart/rebel-sync-tray.desktop")
+OLD_AUTOSTART = os.path.expanduser("~/.config/autostart/companion-sync-tray.desktop")
 
 
 def linux_autostart_entry():
-    return ("[Desktop Entry]\nType=Application\nName=Companion Sync\n"
+    return ("[Desktop Entry]\nType=Application\nName=Rebel Sync\n"
             "Comment=Share one Companion config between rigs\n"
             f"Exec={sys.executable} {os.path.abspath(__file__)} --login\n"
-            "Icon=/opt/companion-sync/icon.png\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
+            "Icon=/opt/rebel-sync/icon.png\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
 
 
 def _mac_app_path():
-    """Where the app really is. .../Companion Sync.app/Contents/MacOS/Companion Sync
-    -> .../Companion Sync.app. A downloaded app that still has the 'from the
+    """Where the app really is. .../Rebel Sync.app/Contents/MacOS/Rebel Sync
+    -> .../Rebel Sync.app. A downloaded app that still has the 'from the
     internet' flag is run by macOS from a hidden read-only copy (App
     Translocation); then this is the real one, e.g. in Applications."""
     here = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
@@ -487,6 +517,53 @@ def _mac_untranslocated(path):
         if os.path.isdir(p):
             return p
     return None
+
+
+def migrate_app_names():
+    """v2.0.0: the login entry under the old name becomes one under the new name."""
+    try:
+        if E.WIN:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+                try:
+                    winreg.QueryValueEx(k, OLD_APP)
+                except OSError:
+                    return
+                winreg.DeleteValue(k, OLD_APP)
+            set_login(True)
+        elif E.MAC:
+            if os.path.exists(OLD_PLIST):
+                os.remove(OLD_PLIST)
+                set_login(True)
+        elif os.path.exists(OLD_AUTOSTART):
+            os.remove(OLD_AUTOSTART)
+            set_login(True)
+    except Exception:
+        log.exception("moving the login entry to the new name")
+
+
+def rename_mac_bundle():
+    """Mac: an update from Companion Sync arrives as '.../Companion Sync.app' (the old
+    updater only knows that name). Rename it to 'Rebel Sync.app' in the same place and
+    reopen. Returns True if the app is about to reopen under the new name."""
+    if not (E.MAC and getattr(sys, "frozen", False)):
+        return False
+    app = _mac_app_path()
+    if os.path.basename(app) != f"{OLD_APP}.app" or "/AppTranslocation/" in app:
+        return False
+    dest = os.path.join(os.path.dirname(app), f"{APP}.app")
+    if os.path.exists(dest) or not os.access(os.path.dirname(app), os.W_OK):
+        return False
+    tmp = tempfile.mkdtemp(prefix="rebel-sync-rename-")
+    script = os.path.join(tmp, "rename.sh")
+    with open(script, "w") as f:
+        f.write('while kill -0 "$1" 2>/dev/null; do sleep 0.5; done\n'
+                'mv "$2" "$3" && open "$3"\n')
+    subprocess.Popen(["/bin/sh", script, str(os.getpid()), app, dest],
+                     env=child_env(), start_new_session=True, close_fds=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
 
 
 def login_enabled():
@@ -531,7 +608,7 @@ def set_login(on):
                 f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>uk.co.nigelisted.companionsync</string>
+  <key>Label</key><string>uk.co.nigelisted.rebelsync</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/open</string><string>-a</string><string>{_mac_app_path()}</string>
   </array>
@@ -586,8 +663,18 @@ class App:
         # On the Pi, a systemd timer may already save every 15 minutes (headless
         # install); then the tray app leaves saving to it.
         self.timer_saves = LINUX and subprocess.run(
-            ["systemctl", "is-enabled", "--quiet", "companion-sync-save.timer"],
+            ["systemctl", "is-enabled", "--quiet", "rebel-sync-save.timer"],
             capture_output=True).returncode == 0
+        if LINUX:
+            # the Pi's taskbar only draws tray icons it can find in the icon theme
+            # (see trayfix.py): give it named pictures in ~/.local/share/icons
+            try:
+                import trayfix
+                folder = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "icons")
+                if trayfix.install(pystray, APP, folder):
+                    trayfix.tidy(folder, APP, [make_icon(k) for k in COLOURS])
+            except Exception:
+                log.exception("tray icon pictures")
         self.icon = pystray.Icon(APP, make_icon("busy"), APP, menu=self.menu())
 
     # -- menu --
@@ -939,7 +1026,7 @@ class App:
                     json.dump(saved, f, indent=2)
                 return
             dest = os.path.join(where, f"{APP}.app")
-            tmp = tempfile.mkdtemp(prefix="companion-sync-move-")
+            tmp = tempfile.mkdtemp(prefix="rebel-sync-move-")
             script = os.path.join(tmp, "move.sh")
             with open(script, "w") as f:
                 f.write('while kill -0 "$1" 2>/dev/null; do sleep 0.5; done\n'
@@ -999,7 +1086,7 @@ class App:
         if not self.latest or time.time() - self.latest[0] > 600:
             try:
                 rel = json.loads(fetch(LATEST_API))
-                name = (rel.get("name") or "").removeprefix("Companion Sync ").strip()
+                name = (rel.get("name") or "").removeprefix("Rebel Sync ").removeprefix("Companion Sync ").strip()
                 self.latest = (time.time(), rel.get("tag_name", "").removeprefix("build-"), name)
             except Exception:
                 self.latest = (time.time() - 540, None, None)  # try again in a minute
@@ -1074,7 +1161,7 @@ class App:
             rig = re.sub(r"[^a-z0-9-]+", "-", rig.lower()).strip("-")
             if not rig:
                 return False, "That rig name has no letters or numbers in it."
-            with open(os.path.join(os.path.expanduser("~"), ".companion-sync-rig-name"), "w") as f:
+            with open(os.path.join(os.path.expanduser("~"), ".rebel-sync-rig-name"), "w") as f:
                 f.write(rig + "\n")
             self.s.rig = rig
             msg.append(f"This rig is now called {rig}.")
@@ -1213,7 +1300,7 @@ class App:
                 tell(f"The config in {self.s.place} isn't encrypted.\n\nTo turn encryption on, do it "
                      f"on the rig that has the config (or take it here first).")
                 return
-            if not ask(f"Encrypt the shared config?\n\nEverything Companion Sync puts in {self.s.place} "
+            if not ask(f"Encrypt the shared config?\n\nEverything Rebel Sync puts in {self.s.place} "
                        f"is then scrambled with a passphrase you choose. Each rig asks for the passphrase "
                        f"once and remembers it.\n\nIf the passphrase is lost, the copy in {self.s.place} "
                        f"can't be read (each rig still has its own copy). Carry on?"):
@@ -1264,14 +1351,14 @@ class App:
             webbrowser.open(RELEASES)
             return
         self.set_state("busy", f"Downloading build {new}…")
-        tmp = tempfile.mkdtemp(prefix="companion-sync-update-")
+        tmp = tempfile.mkdtemp(prefix="rebel-sync-update-")
         dest = os.path.join(tmp, UPDATE_ASSET)
         try:
             fetch(asset["browser_download_url"], dest)
         except Exception as e:
             raise E.SyncError(f"The download didn't finish. Try again.\n{e}")
         log.info("update: build %s -> %s", BUILD, new)
-        self.write_update_marker((rel.get("name") or "").removeprefix("Companion Sync ").strip() or f"build {new}")
+        self.write_update_marker((rel.get("name") or "").removeprefix("Rebel Sync ").removeprefix("Companion Sync ").strip() or f"build {new}")
         self.set_state("busy", f"Installing build {new}…")
         if E.WIN:
             self._update_windows(dest)
@@ -1321,7 +1408,7 @@ class App:
     def _update_pi(self, tgz, tmp, new):
         with tarfile.open(tgz) as t:
             t.extractall(tmp, filter="data")
-        installer = os.path.join(tmp, "companion-sync", "pi", "install.sh")
+        installer = os.path.join(tmp, "rebel-sync", "pi", "install.sh")
         if not os.path.exists(installer):
             raise E.SyncError("The download doesn't contain the installer.")
         cmd = ["/bin/bash", installer, "--from-update"]
@@ -1398,16 +1485,16 @@ class App:
         elif key.startswith("github"):
             mode = key.split("-")[1]
             if mode == "limited" and not ask(
-                    "GitHub, limited: Companion Sync only gets the one repository you pick.\n\n"
-                    "1. Make a PRIVATE repository on GitHub (for example companion-sync-config).\n"
-                    "2. Install Companion Sync on it: your browser will open the page. Choose "
+                    "GitHub, limited: Rebel Sync only gets the one repository you pick.\n\n"
+                    "1. Make a PRIVATE repository on GitHub (for example rebel-sync-config).\n"
+                    "2. Install Rebel Sync on it: your browser will open the page. Choose "
                     "'Only select repositories' and tick just that one.\n"
                     "3. Then sign in with the code shown next.\n\nCarry on?"):
                 return
             if mode == "limited":
                 E.use_github(s, "limited")
                 webbrowser.open(E.github_install_link(s))
-                if not ask("Have you installed Companion Sync on your private repository?"):
+                if not ask("Have you installed Rebel Sync on your private repository?"):
                     return
             E.connect_github(s, mode, show_github_code,
                              lambda repos: choose("Which repository should hold the config?", repos))
@@ -1417,7 +1504,7 @@ class App:
             E.connect_rclone(s, key)
         elif key == "nas":
             path = pick_folder("Choose the shared folder on your network drive or NAS. "
-                               "A CompanionSync folder is made inside it.")
+                               "A RebelSync folder is made inside it.")
             if not path:
                 return
             E.use_folder(s, "nas", path)
@@ -1481,6 +1568,22 @@ class App:
                 log.exception("background loop")
             time.sleep(CHECK_EVERY)
 
+    def start_prefetch(self):
+        """The background download, in its own thread: it can take a while (new
+        modules) and must never hold up Take, Save or the menu."""
+        if getattr(self, "_prefetching", False):
+            return
+        self._prefetching = True
+
+        def go():
+            try:
+                msg = E.prefetch(self.s)
+                if msg:
+                    log.info("%s", msg)
+            finally:
+                self._prefetching = False
+        threading.Thread(target=go, daemon=True).start()
+
     def tick(self, next_save):
         running = E.companion_running(self.s)
         # A service or container is stopped by takes and updates, not by quitting:
@@ -1508,6 +1611,9 @@ class App:
                 if E.save(self.s, quiet=True):
                     self.last_save = datetime.datetime.now()
                 self.refresh(force=True)
+            elif time.time() >= next_save and not self.timer_saves:
+                self.start_prefetch()                       # not held here: get a free config ready
+                self.refresh()
             else:
                 self.refresh()
             if not running:
@@ -1595,6 +1701,10 @@ def main():
         global _mutex
         _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, WIN_MUTEX)
     log.info("started")
+    if rename_mac_bundle():
+        log.info("reopening as %s.app", APP)
+        return
+    migrate_app_names()
     app = App()
     app.run()
     if app.restart:                 # Pi, after an update: open the new copy

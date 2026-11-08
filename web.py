@@ -1,4 +1,4 @@
-"""Companion Sync's web GUI and the local API the pop-up window uses.
+"""Rebel Sync's web GUI and the local API the pop-up window uses.
 
 Served by the tray app on gui_port (default 8090). Open to the network by
 default, like Companion's own GUI; an optional password (gui_password) asks
@@ -18,7 +18,7 @@ LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
 class Handler(BaseHTTPRequestHandler):
     app = None                      # set by serve()
-    server_version = "CompanionSync"
+    server_version = "RebelSync"
 
     def log_message(self, *a):      # quiet: the app has its own log
         pass
@@ -52,7 +52,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _deny(self):
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Companion Sync"')
+        self.send_header("WWW-Authenticate", 'Basic realm="Rebel Sync"')
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -130,7 +130,7 @@ def serve(app, port, network=True):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Companion Sync</title>
+<title>Rebel Sync</title>
 <link rel="icon" href="/logo.png">
 <style>
 :root{--bar:#5a12b4;--hi:#7a2fe0;--on:#b98cff;--line:#2a2340;--ink:#120a22;--val:#5cd8f5;
@@ -226,9 +226,9 @@ details>summary .c{margin-left:auto;color:var(--dim);font-weight:400;font-family
 <main id="main"></main>
 <div id="modal"><div class="box" id="mbox"></div></div>
 <div id="toast"></div>
-<div id="lost"><h1>I've got a bad feeling about this...</h1><p id="lostp">Lost contact with Companion Sync. Trying again…</p></div>
+<div id="lost"><h1>I've got a bad feeling about this...</h1><p id="lostp">Lost contact with Rebel Sync. Trying again…</p></div>
 <script>
-const PAGES=[["status","Status","Who has the config, and what's happening now"],["storage","Storage & sign-in","Where the shared config lives, and signing in to it"],["files","Files","What's stored, what's on this rig, and clean-up"],["encryption","Encryption","Scramble the stored copy with a passphrase"],["settings","Settings","Rig name, timing, pop-up size, network access"],["log","Log","What Companion Sync has been doing"],["update","Update","Check for and install a newer version"],["help","Help","What everything does"]];
+const PAGES=[["status","Status","Who has the config, and what's happening now"],["storage","Storage & sign-in","Where the shared config lives, and signing in to it"],["files","Files","What's stored, what's on this rig, and clean-up"],["encryption","Encryption","Scramble the stored copy with a passphrase"],["settings","Settings","Rig name, timing, pop-up size, network access"],["log","Log","What Rebel Sync has been doing"],["update","Update","Check for and install a newer version"],["help","Help","What everything does"]];
 const COL={mine:"var(--green)",free:"var(--grey)",other:"var(--amber)",problem:"var(--red)",busy:"var(--blue)"};
 let page=(location.hash||"#status").slice(1),S={};
 const $=id=>document.getElementById(id);
@@ -312,14 +312,14 @@ help(){return `<h2>Help</h2><div class="help">
 <h3>Storage and sign-in</h3><p>Every rig must use the same storage and account. On the rig that holds the config, changing storage moves it. Sign-in for Google, Dropbox, OneDrive and GitHub opens a browser on the rig itself.</p>
 <h3>Updating</h3><p>Update installs the newest release and reopens the app. Companion keeps running. A banner appears here and in the pop-up when a newer version is out, and says "Updated to…" afterwards.</p>
 <h3>Pop-up window</h3><p>Click the tray icon. Drag it from anywhere that isn't a button; <kbd>Esc</kbd> or Hide closes it.</p>
-<h3>Lost contact</h3><p>If this page can't reach Companion Sync on the rig, a full-screen message appears and it keeps trying.</p>
+<h3>Lost contact</h3><p>If this page can't reach Rebel Sync on the rig, a full-screen message appears and it keeps trying.</p>
 <h3>Trouble</h3><ul><li>Check the <b>Log</b> page first.</li><li>A take that stops on a module: run <b>Files → Repair modules</b>, then take again.</li><li>Locked by a rig that's gone: after the lost-rig hours (Settings) you'll be asked to take over.</li></ul></div>`},
 encryption(){return `<h2>Encryption</h2><div class="card">${row("Encryption",S.encrypted===null?"—":S.encrypted?"On":"Off",S.encrypted?"ok":"")}</div>
 <div class="btns"><button class="p" title="Turn encryption on or off, or change options" onclick="act('encryption')">${S.encrypted?"Encryption options…":"Turn encryption on…"}</button></div>
 <p class="note">Off by default. Turn it on or off from the rig that has the config. If the passphrase is lost, the copy in storage can't be read.</p>${ASK}`},
 async settings(){const g=await api("/api/settings");const pi=g.platform=="pi";return `<h2>Settings</h2><div class="card" id="setf">
 <label class="f"><span>Rig name${g.holding?" (return the config before renaming)":""}</span><input id="rig" value="${esc(g.rig)}" ${g.holding?"disabled":""}></label>
-<div class="chk"><input type="checkbox" id="login" ${g.start_at_login?"checked":""}><label title="Open Companion Sync when you log in" for="login">Start at login</label></div>
+<div class="chk"><input type="checkbox" id="login" ${g.start_at_login?"checked":""}><label title="Open Rebel Sync when you log in" for="login">Start at login</label></div>
 <label class="f"><span title="What to do when the app starts at login">At login</span><select id="login_action"><option value="tray_only">Just show the icon</option><option value="take_and_open">Take the config and open Companion</option></select></label>
 <label class="f"><span title="How often a rig holding the config saves it">Save every (minutes)</span><input id="save_every_min" type="number" min="1" value="${g.save_every_min}"></label>
 <label class="f"><span title="How many earlier saves are kept in storage">Saves kept in history</span><input id="keep_history" type="number" min="1" value="${g.keep_history}"></label>
@@ -336,7 +336,7 @@ ${pi?`<label class="f"><span>Companion on this Pi</span><select id="companion_mo
 async log(){const r=await api("/api/log?lines=400");return `<h2>Log</h2><pre id="logp">${esc(r.lines.join("\n"))}</pre><div class="btns" style="margin-top:12px"><button title="Load the latest log lines" onclick="render()">Refresh</button></div>`},
 async update(){const u=await api("/api/update");const newer=u.newer;return `<h2>Update</h2><div class="card">${row("This version",esc(u.current))}${row("Latest release",esc(u.latest||"couldn't check"),newer?"warn":"ok")}</div>
 <div class="btns"><button class="p" onclick="act('update')" ${newer?"":"disabled"}>${newer?"Update to "+esc(u.latest):"Up to date"}</button></div>
-<p class="note">Downloads the latest build, installs it and reopens Companion Sync. Companion keeps running.</p>`}
+<p class="note">Downloads the latest build, installs it and reopens Rebel Sync. Companion keeps running.</p>`}
 };
 async function render(){const h=await R[page]();$("main").innerHTML=h;if(page=="settings"){const g=await api("/api/settings");$("login_action").value=g.login_action;if($("companion_mode"))$("companion_mode").value=g.companion_mode||"auto"}if(page=="log"){const p=$("logp");p.scrollTop=p.scrollHeight}}
 async function saveSettings(){const v=id=>$(id)?$(id).value:undefined,c=id=>$(id)?$(id).checked:undefined;
@@ -360,8 +360,8 @@ if(p.kind=="choose"){const c=document.querySelector("input[name=ch]:checked");v=
 async function ans(v){const p=S.prompt;if(!p)return;$("modal").style.display="none";await api("/api/answer",{id:p.id,value:v});setTimeout(load,300)}
 let misses=0;
 async function load(){try{S=await api("/api/status");misses=0;$("lost").style.display="none"}catch(e){
-if(++misses>=2){$("lostp").textContent="Lost contact with Companion Sync"+(S.rig?" on "+S.rig:"")+". Trying again…";$("lost").style.display="flex"}
-$("tp").innerHTML='<div class="tpt bad">Can\'t reach Companion Sync</div>';$("led").style.background="var(--red)";return}
+if(++misses>=2){$("lostp").textContent="Lost contact with Rebel Sync"+(S.rig?" on "+S.rig:"")+". Trying again…";$("lost").style.display="flex"}
+$("tp").innerHTML='<div class="tpt bad">Can\'t reach Rebel Sync</div>';$("led").style.background="var(--red)";return}
 $("sub").textContent=S.rig+" · "+(S.label||"build "+S.build);$("led").style.background=COL[S.state]||"var(--grey)";topBar();
 prompt();
 if(["status","storage","encryption"].includes(page))render()}

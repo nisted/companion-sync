@@ -65,9 +65,9 @@
     4,
     5
   ],
-  "boot_report": "/run/companion-sync/boot.json",
-  "log_file": "~/.local/state/companion-sync/panel.log",
-  "github_repo": "nisted/companion-sync",
-  "github_token_file": "~/.config/companion-sync/github-token",
+  "boot_report": "/run/rebel-sync/boot.json",
+  "log_file": "~/.local/state/rebel-sync/panel.log",
+  "github_repo": "nisted/rebel-sync",
+  "github_token_file": "~/.config/rebel-sync/github-token",
   "pi_asset": "Companion-Sync-Pi.tar.gz"
 }

@@ -1,8 +1,8 @@
 """Touch calibration: tap four crosses, the result is saved to panel.json.
 
-  sudo systemctl stop companion-panel
-  python3 /opt/companion-sync/panel/calibrate.py
-  sudo systemctl start companion-panel
+  sudo systemctl stop rebel-sync-panel
+  python3 /opt/rebel-sync/panel/calibrate.py
+  sudo systemctl start rebel-sync-panel
 
 Works on either screen and in any rotation. The result is stored for the
 current screen only (panel.json "screens" block), in the rotation-0 frame, so

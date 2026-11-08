@@ -1,4 +1,4 @@
-"""The Companion Sync icon, made from logo-source.png (Nige's artwork)."""
+"""The Rebel Sync icon, made from logo-source.png (Nige's artwork)."""
 import os
 import sys
 

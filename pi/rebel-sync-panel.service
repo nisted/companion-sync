@@ -1,10 +1,10 @@
 [Unit]
-Description=BD-1 touchscreen panel (Companion Sync)
+Description=BD-1 touchscreen panel (Rebel Sync)
 After=local-fs.target
 
 [Service]
 User=@USER@
-ExecStart=/usr/bin/python3 /opt/companion-sync/panel/panel.py
+ExecStart=/usr/bin/python3 /opt/rebel-sync/panel/panel.py
 Restart=always
 RestartSec=3
 TimeoutStopSec=10

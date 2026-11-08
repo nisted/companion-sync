@@ -1,0 +1,17 @@
+[Unit]
+Description=Rebel Sync: take the config before Companion starts (gives up quickly, never blocks it)
+After=network.target
+Before=companion.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+RuntimeDirectory=rebel-sync
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/timeout 75 /usr/local/bin/rebel-sync boot --report /run/rebel-sync/boot.json
+SuccessExitStatus=124
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -1,16 +1,16 @@
-# Companion Sync: Roadmap
+# Rebel Sync: Roadmap
 
 Tick things off by editing this file.
 
 ## Done
 
-- [x] Google Cloud project "Companion Sync" and OAuth desktop client (Internal)
+- [x] Google Cloud project "Rebel Sync" and OAuth desktop client (Internal)
 - [x] GitHub repo and Actions builds; each build on `main` is published as a release
 - [x] Engine: take, save (15 min, live SQLite snapshot), return, 24-hour stale takeover, stranded edits, Drive history (last 30), Companion version handling, saved rig names
 - [x] 18 scenario tests for the engine
 - [x] Windows and Mac tray apps (build 6): status icon, menu, auto-return on quit, start at login
 - [x] Nige's CS logo
-- [x] "Update Companion Sync" menu item and build number
+- [x] "Update Rebel Sync" menu item and build number
 - [x] Windows installer; one-click update (download, install, reopen) on Windows, Mac and Pi
 - [x] Companion-style tray: mini menu, pop-up window, web GUI (port 8090), Take config (build 21)
 - [x] Public repo (free)

@@ -144,9 +144,9 @@ class Hardware:
         self.W, self.H = screen_size(cfg)
         chip = _find_chip()
         self.dc, self.rst, self.irq = s["pin_dc"], s["pin_rst"], s["pin_touch_irq"]
-        self.outs = gpiod.request_lines(chip, consumer="companion-panel", config={
+        self.outs = gpiod.request_lines(chip, consumer="rebel-sync-panel", config={
             (self.dc, self.rst): gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.ACTIVE)})
-        self.ins = gpiod.request_lines(chip, consumer="companion-panel", config={
+        self.ins = gpiod.request_lines(chip, consumer="rebel-sync-panel", config={
             self.irq: gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP)})
         self.lcd = spidev.SpiDev()
         self.lcd.open(cfg["spi_bus"], cfg["spi_lcd_cs"])

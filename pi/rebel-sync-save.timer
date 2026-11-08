@@ -1,5 +1,5 @@
 [Unit]
-Description=Save Companion config to Google Drive every 15 minutes
+Description=Rebel Sync: save (or get ready) every 15 minutes
 
 [Timer]
 OnBootSec=5min

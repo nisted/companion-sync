@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""Companion Sync: share one Companion config between rigs, through a storage
+"""Rebel Sync: share one Companion config between rigs, through a storage
 of your choice (Google Drive, GitHub, Dropbox, OneDrive, a network folder or iCloud Drive).
 
-  companion-sync setup    choose where the config is stored (or move it), sign in, check
-  companion-sync status   who holds the config right now
-  companion-sync take     lock the config to this rig and download it
-  companion-sync save     upload this rig's current config, keep the lock
-  companion-sync return   upload this rig's config and release the lock
-  companion-sync boot --report FILE
+  rebel-sync setup    choose where the config is stored (or move it), sign in, check
+  rebel-sync status   who holds the config right now
+  rebel-sync take     lock the config to this rig and download it
+  rebel-sync save     upload this rig's current config, keep the lock
+  rebel-sync return   upload this rig's config and release the lock
+  rebel-sync tick     the 15-minute job: the holder saves; any other rig downloads
+                          a free config into its waiting area, ready for a quick take
+  rebel-sync boot --report FILE
                           at start-up, before Companion runs: take the config
                           if it's free or already this rig's, never ask, never
                           wait long; the outcome is written to FILE as JSON
-  companion-sync unlock   give this rig the passphrase of an encrypted config
-  companion-sync encryption on|off
+  rebel-sync unlock   give this rig the passphrase of an encrypted config
+  rebel-sync encryption on|off
                           encrypt the stored config (or stop), from the rig that has it
 
 On Linux (the Pi), Companion can run as CompanionPi's service, the desktop
 app or a Docker container; which one is detected, or set in
-~/.config/companion-sync/settings.json ("companion_mode").
+~/.config/rebel-sync/settings.json ("companion_mode").
 
 Only one rig holds the config at a time. The holder saves every 15 minutes
 (SQLite live backup, so Companion keeps running). A lock not refreshed for
@@ -35,6 +37,7 @@ import contextlib
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -95,7 +98,7 @@ class Settings:
     safety_dir: str                    # safety copies, OUTSIDE base
     holding_file: str                  # local note: this rig took the config
     rig: str = field(default_factory=lambda: socket.gethostname().split(".")[0].lower())
-    folder: str = "CompanionSync"      # folder in the storage (Google Drive, Dropbox, OneDrive, GitHub)
+    folder: str = "RebelSync"      # folder in the storage (Google Drive, Dropbox, OneDrive, GitHub)
     rclone: str = "rclone"
     rclone_config: str = ""            # blank = rclone's default
     rclone_flags: list = field(default_factory=list)   # extra flags on every rclone call
@@ -133,6 +136,8 @@ class Settings:
     keep_local: int = 5
     keep_history: int = 30
     stale_hours: float = 24
+    claim_wait: float = 0              # seconds between claiming the lock and checking (0 = per storage)
+    waiting_dir: str = ""              # the waiting area: config and modules downloaded ahead of a take
     log: object = print
 
     @property
@@ -196,30 +201,82 @@ def stable_rig_name(path):
     return name
 
 
+# ---- the rename (v2.0.0): Companion Sync -> Rebel Sync -------------------------
+# Each rig's own files move to the new names the first time v2 runs; the shared
+# storage folder moves too (migrate_storage), leaving a "moved" note for rigs
+# still on the old version.
+
+OLD_PREFIX, NEW_PREFIX = ".companion-sync-", ".rebel-sync-"
+OLD_FOLDER = "CompanionSync"
+
+
+def migrate_local_names(home=None):
+    """Move this rig's old Companion Sync files to their Rebel Sync names.
+    Never overwrites: if both exist, the new one stays and the old one is left."""
+    home = home or os.path.expanduser("~")
+    try:
+        for n in os.listdir(home):
+            if n.startswith(OLD_PREFIX):
+                new = os.path.join(home, NEW_PREFIX + n[len(OLD_PREFIX):])
+                if not os.path.exists(new):
+                    os.replace(os.path.join(home, n), new)
+    except OSError:
+        pass
+    old, new = os.path.join(home, ".config", "companion-sync"), os.path.join(home, ".config", "rebel-sync")
+    if os.path.isdir(old) and not os.path.islink(old):
+        try:
+            if not os.path.exists(new):
+                os.replace(old, new)
+            else:                                   # both: bring over anything missing
+                for n in os.listdir(old):
+                    if not os.path.exists(os.path.join(new, n)):
+                        os.replace(os.path.join(old, n), os.path.join(new, n))
+        except OSError:
+            pass
+
+
+def _migrate_safety_dir(s):
+    """Safety copies kept next to Companion's folder: old name -> new name."""
+    if not s.safety_dir:
+        return
+    old = os.path.join(os.path.dirname(s.safety_dir), "companion-sync-safety-copies")
+    try:
+        if s.sudo_files:
+            if run(["sudo", "test", "-d", old], check=False).returncode == 0 and \
+                    run(["sudo", "test", "-e", s.safety_dir], check=False).returncode != 0:
+                run(["sudo", "mv", old, s.safety_dir], check=False)
+        elif os.path.isdir(old) and not os.path.exists(s.safety_dir):
+            os.replace(old, s.safety_dir)
+    except Exception:
+        pass
+
+
 def default_settings(**kw):
     home = os.path.expanduser("~")
+    migrate_local_names(home)
     if WIN:
         appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
         app = next((p for p in (
             os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Companion", "Companion.exe"),
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "companion", "Companion.exe"),
         ) if os.path.exists(p)), "")
-        s = Settings("win", _pick_base(appdata), os.path.join(appdata, "companion-sync-safety-copies"),
-                     os.path.join(home, ".companion-sync-holding"), companion_app=app)
+        s = Settings("win", _pick_base(appdata), os.path.join(appdata, "rebel-sync-safety-copies"),
+                     os.path.join(home, ".rebel-sync-holding"), companion_app=app)
     elif MAC:
         sup = os.path.join(home, "Library", "Application Support")
-        s = Settings("mac", _pick_base(sup), os.path.join(sup, "companion-sync-safety-copies"),
-                     os.path.join(home, ".companion-sync-holding"), companion_app="Companion")
+        s = Settings("mac", _pick_base(sup), os.path.join(sup, "rebel-sync-safety-copies"),
+                     os.path.join(home, ".rebel-sync-holding"), companion_app="Companion")
     else:
-        s = Settings("pi", "", "", os.path.join(home, ".companion-sync-holding"),
+        s = Settings("pi", "", "", os.path.join(home, ".rebel-sync-holding"),
                      login_action="take_and_open")
-    s.rig = stable_rig_name(os.path.join(home, ".companion-sync-rig-name"))
-    s.state_file = os.path.join(home, ".companion-sync-state.json")
-    s.storage_file = os.path.join(home, ".companion-sync-storage.json")
-    s.github_token_file = os.path.join(home, ".companion-sync-github.json")
-    s.key_file = os.path.join(home, ".companion-sync-key.json")
-    s.settings_file = os.path.join(home, ".config", "companion-sync", "settings.json")
-    s.progress = Progress(os.path.join(home, ".companion-sync-progress.json"))
+    s.rig = stable_rig_name(os.path.join(home, ".rebel-sync-rig-name"))
+    s.state_file = os.path.join(home, ".rebel-sync-state.json")
+    s.storage_file = os.path.join(home, ".rebel-sync-storage.json")
+    s.github_token_file = os.path.join(home, ".rebel-sync-github.json")
+    s.key_file = os.path.join(home, ".rebel-sync-key.json")
+    s.settings_file = os.path.join(home, ".config", "rebel-sync", "settings.json")
+    s.progress = Progress(os.path.join(home, ".rebel-sync-progress.json"))
+    s.waiting_dir = os.path.join(home, ".rebel-sync-waiting")
     s.cancel = threading.Event()
     for k, v in kw.items():
         setattr(s, k, v)
@@ -229,11 +286,12 @@ def default_settings(**kw):
     elif s.companion_base:
         s.base = s.companion_base
     load_storage_choice(s)
+    _migrate_safety_dir(s)
     return s
 
 
 # ---- this rig's own settings -----------------------------------------------
-# ~/.config/companion-sync/settings.json, all optional, e.g.
+# ~/.config/rebel-sync/settings.json, all optional, e.g.
 #   {"companion_mode": "docker", "docker_container": "companion",
 #    "login_action": "tray_only"}
 
@@ -320,7 +378,7 @@ def configure_linux(s):
     else:
         s.base = s.companion_base or _pick_base(os.path.join(home, ".config"))
         s.companion_app = s.companion_app or find_linux_companion()
-    s.safety_dir = os.path.join(os.path.dirname(s.base.rstrip("/")) or home, "companion-sync-safety-copies")
+    s.safety_dir = os.path.join(os.path.dirname(s.base.rstrip("/")) or home, "rebel-sync-safety-copies")
     here = s.base if os.path.exists(s.base) else os.path.dirname(s.base.rstrip("/"))
     # A service's files belong to the 'companion' user; a container often writes as root.
     s.sudo_files = (s.companion_mode in ("service", "docker")
@@ -366,6 +424,11 @@ def stop_all():
 
 def _cancelled(s):
     return s is not None and s.cancel is not None and s.cancel.is_set()
+
+
+def _stop_if_cancelled(s):
+    if _cancelled(s):
+        raise Cancelled("Cancelled.")
 
 
 def run(cmd, check=True, input=None, timeout=None, s=None, transfer=False):
@@ -570,7 +633,7 @@ def signed_in(s):
 
 # ---- storage ---------------------------------------------------------------
 # Everything the sync needs from wherever the shared config lives. Paths are
-# relative to the Companion Sync folder there ('' is the folder itself), with
+# relative to the Rebel Sync folder there ('' is the folder itself), with
 # '/' as the separator. Reads raise Offline when the storage can't be reached;
 # a missing file or folder is not an error.
 
@@ -619,6 +682,17 @@ class RcloneStorage:
 
     def exists(self, rel):
         return rc(self.s, "lsf", self._p(rel), check=False).returncode == 0
+
+    def files(self, rel):
+        """Names of the files directly in `rel` (none if it doesn't exist)."""
+        r = rc(self.s, "lsf", "--files-only", self._p(rel), check=False)
+        _raise_if_offline(r, self.s.place)
+        return sorted(r.stdout.split()) if r.returncode == 0 else []
+
+    def mirror_tree(self, rel, local):
+        """Make the local folder match `rel` (only what changed is fetched)."""
+        os.makedirs(local, exist_ok=True)
+        rc(self.s, "sync", self._p(rel), local, "--exclude", EXCLUDE, transfer=True)
 
     def push_tree(self, local, rel, backup_rel=None):
         """Make `rel` match the local folder (Companion's own backups excluded),
@@ -702,7 +776,7 @@ class RcloneStorage:
 
 class FolderStorage:
     """A shared folder: network share / NAS, or a folder a sync app keeps up to
-    date (iCloud Drive). The folder itself must exist; Companion Sync makes
+    date (iCloud Drive). The folder itself must exist; Rebel Sync makes
     everything inside it."""
 
     def __init__(self, root):
@@ -763,6 +837,13 @@ class FolderStorage:
 
     def exists(self, rel):
         return os.path.exists(self._p(rel))
+
+    def files(self, rel):
+        self._check()
+        p = self._p(rel)
+        if not os.path.isdir(p):
+            return []
+        return sorted(n for n in os.listdir(p) if os.path.isfile(os.path.join(p, n)) and not n.endswith(".tmp"))
 
     @staticmethod
     def _files(top):
@@ -835,7 +916,7 @@ class FolderStorage:
 # ---- encryption (optional, off by default) ----------------------------------
 # When it's on, every config and module file is encrypted on the rig before it
 # leaves, so the storage only ever holds scrambled copies, named '<file>.enc'.
-# (An older Companion Sync then finds no db.sqlite and refuses, rather than
+# (An older Rebel Sync then finds no db.sqlite and refuses, rather than
 # installing scrambled files.) LOCK, CURRENT, checks/ and modules.json stay
 # readable: they hold rig names and versions, nothing from the config.
 #
@@ -876,7 +957,7 @@ class Cipher:
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         except ImportError:
-            raise SyncError("This copy of Companion Sync can't do encryption (the 'cryptography' "
+            raise SyncError("This copy of Rebel Sync can't do encryption (the 'cryptography' "
                             "package is missing).")
         self.aes, self.nonce_key = AESGCM(key[:32]), key[32:]
 
@@ -888,7 +969,7 @@ class Cipher:
 
     def open(self, name, blob):
         if not blob.startswith(ENC_MAGIC):
-            raise SyncError(f"{name} isn't a Companion Sync encrypted file.")
+            raise SyncError(f"{name} isn't a Rebel Sync encrypted file.")
         n = len(ENC_MAGIC)
         try:
             return self.aes.decrypt(blob[n:n + 12], blob[n + 12:], name.encode())
@@ -990,7 +1071,7 @@ def _save_key(s, salt_b64, key):
 
 def _check_key(marker, key):
     try:
-        return Cipher(key).open("check", _unb64(marker["check"])) == b"companion-sync"
+        return Cipher(key).open("check", _unb64(marker["check"])) == b"companion-sync"   # stays: existing encrypted configs were made with it
     except SyncError as e:
         if "can't do encryption" in str(e):
             raise
@@ -1109,7 +1190,7 @@ def _http_json(method, url, body=None, headers=None, form=False):
     import urllib.parse
     import urllib.request
     data = None
-    hdrs = {"Accept": "application/vnd.github+json", "User-Agent": "companion-sync",
+    hdrs = {"Accept": "application/vnd.github+json", "User-Agent": "rebel-sync",
             "X-GitHub-Api-Version": "2022-11-28"}
     hdrs.update(headers or {})
     if body is not None:
@@ -1197,9 +1278,9 @@ def _gh_user(s, method, path, body=None):
     return st, d
 
 
-GITHUB_DEFAULT_REPO = "companion-sync-config"
-GITHUB_README = ("# Companion Sync config\n\n"
-                 "Bitfocus Companion settings kept in sync by Companion Sync.\n"
+GITHUB_DEFAULT_REPO = "rebel-sync-config"
+GITHUB_README = ("# Rebel Sync config\n\n"
+                 "Bitfocus Companion settings kept in sync by Rebel Sync.\n"
                  "Keep this repository private.\n")
 
 # The two registered GitHub apps (Client IDs are public; no secrets are used)
@@ -1229,7 +1310,7 @@ def github_quick_setup(s, name=GITHUB_DEFAULT_REPO):
     if st == 404:
         st, repo = _gh_user(s, "POST", "/user/repos",
                             {"name": name, "private": True,
-                             "description": "Companion config shared by Companion Sync"})
+                             "description": "Companion config shared by Rebel Sync"})
         if st not in (200, 201):
             raise SyncError(f"Couldn't make the repository {full}: {(repo or {}).get('message', st)}")
     elif st != 200:
@@ -1247,17 +1328,17 @@ def github_install_link(s):
 
 def github_granted_repos(s):
     """'Limited' option: the repositories this sign-in was given, i.e. those the
-    person ticked when installing the Companion Sync GitHub App."""
+    person ticked when installing the Rebel Sync GitHub App."""
     st, inst = _gh_user(s, "GET", "/user/installations")
     if st != 200:
-        raise SyncError(f"Couldn't ask GitHub which repositories Companion Sync can use ({st}).")
+        raise SyncError(f"Couldn't ask GitHub which repositories Rebel Sync can use ({st}).")
     repos = []
     for i in inst.get("installations", []):
         st, r = _gh_user(s, "GET", f"/user/installations/{i['id']}/repositories")
         if st == 200:
             repos += [x["full_name"] for x in r.get("repositories", [])]
     if not repos:
-        raise SyncError("Companion Sync hasn't been given a repository yet.\n\n"
+        raise SyncError("Rebel Sync hasn't been given a repository yet.\n\n"
                         "Make a private repository on GitHub, then open this link and tick just that one:\n"
                         f"  {github_install_link(s)}")
     return sorted(set(repos))
@@ -1338,7 +1419,7 @@ class GitHubStorage:
                 # GitHub won't take files the fast way into an empty repository, so start it
                 # off with a README through the simple file API, then save as normal.
                 self._api("PUT", "/contents/README.md",
-                          {"message": "Start Companion Sync storage",
+                          {"message": "Start Rebel Sync storage",
                            "content": base64.b64encode(GITHUB_README.encode("utf-8")).decode(),
                            "branch": self.s.github_branch}, ok=(200, 201, 422))
                 head, base_tree = self._head()
@@ -1422,6 +1503,11 @@ class GitHubStorage:
     def exists(self, rel):
         full = self._full(rel)
         return any(p == full or p.startswith(full + "/") for p in self._tree())
+
+    def files(self, rel):
+        pre = self._full(rel)
+        pre = pre + "/" if pre else ""
+        return sorted(p[len(pre):] for p in self._tree() if p.startswith(pre) and "/" not in p[len(pre):])
 
     def _local_files(self, local, skip_backups):
         files = {}
@@ -1536,7 +1622,7 @@ def use_rclone(s, kind):
 
 def use_folder(s, kind, path):
     """kind 'nas' or 'icloud'. `path` is the folder chosen (or the iCloud Drive
-    folder); the config goes in a CompanionSync folder inside it."""
+    folder); the config goes in a RebelSync folder inside it."""
     if not path or not os.path.isdir(path):
         raise SyncError(f"Can't find the folder:\n  {path or '(none chosen)'}")
     target = path if os.path.basename(path.rstrip("/\\")) == s.folder else os.path.join(path, s.folder)
@@ -1589,7 +1675,7 @@ def connect_rclone_elsewhere(s, kind, get_token):
     if kind == "gdrive":
         cid, secret = google_client()
         if not cid:
-            raise SyncError("This copy of Companion Sync has no Google sign-in details.")
+            raise SyncError("This copy of Rebel Sync has no Google sign-in details.")
         opts = ["scope=drive.file", f"client_id={cid}", f"client_secret={secret}"]
     rc(s, "config", "delete", remote, check=False)
     r = rc(s, "config", "create", remote, typ, *opts, "config_is_local=false", "--non-interactive")
@@ -1661,6 +1747,7 @@ def local_version(s):
 
 
 def drive_version(s):
+    migrate_storage(s)
     cur = (s.store.read("CURRENT") or "").strip()
     if vkey(cur):
         return cur
@@ -1697,7 +1784,7 @@ def describe_companion(s):
 
 
 def companion_managed(s):
-    """True where Companion Sync stops and starts Companion itself (service,
+    """True where Rebel Sync stops and starts Companion itself (service,
     container); False where it's an app the person opens and quits."""
     return s.platform == "pi" and s.companion_mode in ("service", "docker")
 
@@ -1870,6 +1957,7 @@ def _raise_if_offline(r, place="Google Drive"):
 
 
 def lock_holder(s):
+    migrate_storage(s)
     text = s.store.read("LOCK")
     return (text.strip() or None) if text is not None else None
 
@@ -1893,6 +1981,163 @@ def write_lock(s, taken):
     s.store.write("LOCK", f"{s.rig} | taken {taken} | last seen {now()}\n")
 
 
+# ---- claiming the lock (v2.0.0, agreed 8 Nov) ---------------------------------
+# Two rigs could both read "free" and both write LOCK; the second write would win
+# silently (and Google Drive can even hold two files called LOCK). So a rig first
+# writes its own claim file, waits, and looks: if its claim is the only one, it
+# writes LOCK. If not, every claimer removes its claim and tries again after a
+# random wait. No clocks are compared, and it works on every storage.
+
+CLAIM_WAIT = {"nas": 1.5, "github": 3, "gdrive": 4, "dropbox": 4, "onedrive": 4, "icloud": 12}
+CLAIM_STALE_HOURS = 10 / 60          # a claim left behind by a rig that died mid-claim
+CLAIM_TRIES = 6
+
+
+def _claim_wait(s):
+    return s.claim_wait or CLAIM_WAIT.get(s.storage_kind, 4)
+
+
+def _other_claims(s):
+    others = []
+    for n in s.store.files("claims"):
+        if n == s.rig:
+            continue
+        if s.store.age_hours(f"claims/{n}") > CLAIM_STALE_HOURS:
+            with contextlib.suppress(Exception):
+                s.store.delete(f"claims/{n}")
+            continue
+        others.append(n)
+    return others
+
+
+def claim_lock(s, before):
+    """Lock the config to this rig. `before` is the LOCK text when the take
+    started (None if free, or a lost rig's lock being taken over). Raises
+    SyncError if another rig got there first."""
+    wait = _claim_wait(s)
+    me = f"claims/{s.rig}"
+    for _ in range(CLAIM_TRIES):
+        _stop_if_cancelled(s)
+        s.store.write(me, f"{s.rig} claims the config {now()} {random.random():.6f}\n")
+        try:
+            time.sleep(wait)
+            h = lock_holder(s)
+            if (h or None) != (before or None) and holder_name(h) != s.rig:
+                raise SyncError(f"{holder_name(h)} took the config a moment before this rig did.")
+            if not _other_claims(s):
+                write_lock(s, now())
+                return
+        finally:
+            with contextlib.suppress(Exception):
+                s.store.delete(me)
+        time.sleep(random.uniform(wait, 3 * wait))           # someone else is claiming too
+    raise SyncError("Another rig kept trying to take the config at the same moment. Try again.")
+
+
+def release_lock(s, before):
+    """Put the lock back as it was before a take that didn't finish."""
+    with contextlib.suppress(Exception):
+        if holder_name(lock_holder(s)) == s.rig:
+            if before:
+                s.store.write("LOCK", before.rstrip("\n") + "\n")
+            else:
+                s.store.delete("LOCK")
+
+
+# ---- the log in the storage ---------------------------------------------------
+# A readable history (takes, saves, returns). Only the rig holding the lock writes
+# it, so two rigs never write it at once. Never stops a job.
+
+STORAGE_LOG = "LOG.txt"
+STORAGE_LOG_LINES = 1000
+
+
+def storage_log(s, text):
+    try:
+        if holder_name(lock_holder(s)) != s.rig:
+            return
+        lines = (s.store.read(STORAGE_LOG) or "").splitlines()[-(STORAGE_LOG_LINES - 1):]
+        lines.append(f"{now()}  {s.rig}: {text}")
+        s.store.write(STORAGE_LOG, "\n".join(lines) + "\n")
+    except Exception as e:                                   # noqa: BLE001
+        s.log(f"(storage log not written: {e})")
+
+
+# ---- the storage folder's new name (v2.0.0) ------------------------------------
+
+MOVED_FOR_RENAME = ("to the RebelSync folder: Companion Sync is now Rebel Sync. Update this rig "
+                    "(github.com/nisted/rebel-sync) and it carries on by itself")
+
+
+def migrate_storage(s):
+    """Rename the shared CompanionSync folder to RebelSync, once, leaving a note in
+    the old place so rigs still on Companion Sync are told (and never use it).
+    Google Drive / Dropbox / OneDrive (rclone) and network / iCloud folders; a
+    GitHub repository keeps its name. Raises SyncError if the move is needed but
+    fails, so nothing ever mistakes the new, empty folder for an empty storage."""
+    key = (s.storage, s.rclone_remote, s.folder, s.folder_path)
+    if getattr(s, "_storage_migrated", False) or key in _MIGRATED:
+        return
+    _migrate_storage(s)
+    if getattr(s, "_storage_migrated", False) and s.storage == "rclone":   # a folder check is cheap
+        _MIGRATED.add(key)
+
+
+_MIGRATED = set()                    # storages already checked by this process
+
+
+def _migrate_storage(s):
+    if s.storage == "rclone" and s.folder == "RebelSync":
+        old = f"{s.rclone_remote}:{OLD_FOLDER}"
+        r = rc(s, "lsf", s.remote, check=False)
+        _raise_if_offline(r, s.place)
+        if r.returncode == 0 and r.stdout.strip():
+            s._storage_migrated = True
+            return
+        r = rc(s, "lsf", old, check=False)
+        if r.returncode != 0 or not r.stdout.strip():
+            s._storage_migrated = True                      # nothing to move (new storage)
+            return
+        if "MOVED" in r.stdout.split():
+            s._storage_migrated = True
+            return
+        s.log(f"Renaming the {OLD_FOLDER} folder in {s.place} to RebelSync...")
+        r = rc(s, "moveto", old, s.remote, check=False)
+        if r.returncode != 0 and not rc(s, "lsf", f"{s.remote}/CURRENT", check=False).stdout.strip():
+            raise SyncError(f"Couldn't rename the {OLD_FOLDER} folder in {s.place} to RebelSync.\n"
+                            f"{r.stderr.strip()[-300:]}")
+        rc(s, "rcat", f"{old}/MOVED", input=MOVED_FOR_RENAME + "\n", check=False)
+        rc(s, "rcat", f"{old}/LOCK", input=f"moved to RebelSync | taken {now()} | last seen {now()}\n", check=False)
+    elif s.storage == "folder" and os.path.basename(s.folder_path.rstrip("/\\")) == OLD_FOLDER:
+        old = s.folder_path.rstrip("/\\")
+        new = os.path.join(os.path.dirname(old), "RebelSync")
+        if not os.path.isdir(old):
+            return                                          # not reachable now: try next time
+        if os.path.exists(os.path.join(old, "MOVED")):
+            if os.path.isdir(new):
+                s.folder_path = new
+                save_storage_choice(s)
+            s._storage_migrated = True
+            return
+        if os.path.exists(new) and os.listdir(new):
+            raise SyncError(f"There's already a RebelSync folder next to {old}. Move one of them away.")
+        try:
+            if os.path.exists(new):
+                os.rmdir(new)
+            os.replace(old, new)
+            os.makedirs(old, exist_ok=True)
+            with open(os.path.join(old, "MOVED"), "w") as f:
+                f.write(MOVED_FOR_RENAME + "\n")
+            with open(os.path.join(old, "LOCK"), "w") as f:
+                f.write(f"moved to RebelSync | taken {now()} | last seen {now()}\n")
+        except OSError as e:
+            raise SyncError(f"Couldn't rename {old} to RebelSync: {e}")
+        s.folder_path = new
+        save_storage_choice(s)
+        s.log(f"Renamed the shared folder to {new}")
+    s._storage_migrated = True
+
+
 def mark_holding(s, on):
     if on:
         with open(s.holding_file, "w") as f:
@@ -1910,7 +2155,7 @@ def was_holding(s):
 def upload(s, version, dest=None):
     """Snapshot `version` and upload it (to the main copy by default).
 
-    `dest` is a path inside the Companion Sync folder. Only changed files are
+    `dest` is a path inside the Rebel Sync folder. Only changed files are
     sent; anything replaced in the main copy is kept in history/ so you can
     roll back.
     """
@@ -2010,23 +2255,117 @@ def _write_modules_list(s):
     s.store.write("modules/modules.json", json.dumps(listing, indent=2) + "\n")
 
 
-def download_modules(s):
-    """Copy in module versions this rig is missing. Companion must be stopped. Returns their names."""
+def _complete_local_modules(s, sub):
+    """Module folders this rig already has complete (with companion/manifest.json).
+
+    Companion's folders can belong to another user (CompanionPi's service runs as
+    'companion'), so this rig's user can't look inside them: then it's one sudo
+    'find' for all of them. (v1.2.0-v1.6.0 checked each one without sudo, saw none,
+    and re-downloaded every module on every take: about 3 hours on BD-1, 8 Nov.)"""
+    d = os.path.join(s.base, sub)
+    if s.sudo_files:
+        r = run(["sudo", "find", d, "-mindepth", "3", "-maxdepth", "3",
+                 "-path", "*/companion/manifest.json"], check=False)
+        names = {p[len(d) + 1:].split("/")[0] for p in r.stdout.splitlines() if p.startswith(d + "/")}
+        return {n for n in names if MODULE_FOLDER_RE.match(n)}
+    return {n for n in _local_module_folders(s, sub)
+            if os.path.exists(os.path.join(d, n, "companion", "manifest.json"))}
+
+
+def waiting_area(s):
+    """Where config and modules are downloaded ahead of a take (never Companion's folder)."""
+    return s.waiting_dir or os.path.join(os.path.dirname(s.holding_file) or ".", ".rebel-sync-waiting")
+
+
+@contextlib.contextmanager
+def _waiting_lock(s):
+    """Only one process fills the waiting area at a time. Yields True if this one
+    has it; False means another process is using it right now."""
+    d = waiting_area(s)
+    os.makedirs(d, exist_ok=True)
+    busy = os.path.join(d, ".busy")
+    try:
+        with open(busy) as f:
+            pid = int(f.read().strip() or 0)
+        if pid and pid != os.getpid() and _pid_alive(pid):
+            yield False
+            return
+    except (OSError, ValueError):
+        pass
+    with open(busy, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        yield True
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(busy)
+
+
+def _pid_alive(pid):
+    if WIN:
+        r = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], check=False)
+        return str(pid) in r.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _mirror_config(s, store, version, local):
+    """Make `local` match the stored config. rclone fetches only what changed;
+    the other storages (and encrypted ones) fetch it fresh."""
+    if isinstance(store, RcloneStorage):
+        store.mirror_tree(version, local)
+        return
+    fresh = local + ".new"
+    shutil.rmtree(fresh, ignore_errors=True)
+    store.pull_tree(version, fresh)
+    shutil.rmtree(local, ignore_errors=True)
+    os.replace(fresh, local)
+
+
+def fetch_modules(s, where):
+    """Download into `where` the module versions in the storage that this rig
+    doesn't have yet (and that aren't already waiting there). Companion keeps
+    running. Returns their names."""
     added = []
     store = data_store(s)
-    with tempfile.TemporaryDirectory() as tmp:
-        for sub in MODULE_KINDS:
-            have = {n for n in _local_module_folders(s, sub)
-                    if os.path.exists(os.path.join(s.base, sub, n, "companion", "manifest.json"))}
-            for name in _drive_module_folders(s, sub):
-                if name in have:
-                    continue
-                dl = os.path.join(tmp, sub, name)
-                s.log(f"Downloading module {name}...")
-                store.copy_down(f"modules/{sub}/{name}", dl)
-                if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
-                    s.log(f"Skipped module {name}: incomplete in {s.place}")
-                    continue
+    for sub in MODULE_KINDS:
+        have = _complete_local_modules(s, sub)
+        for name in _drive_module_folders(s, sub):
+            if name in have:
+                continue
+            dl = os.path.join(where, sub, name)
+            if os.path.exists(os.path.join(dl, "companion", "manifest.json")):
+                continue                                    # already waiting
+            shutil.rmtree(dl, ignore_errors=True)
+            s.log(f"Downloading module {name}...")
+            store.copy_down(f"modules/{sub}/{name}", dl)
+            if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
+                s.log(f"Skipped module {name}: incomplete in {s.place}")
+                shutil.rmtree(dl, ignore_errors=True)
+                continue
+            added.append(name)
+    return added
+
+
+def install_modules(s, where):
+    """Copy the waiting module versions this rig is missing into Companion's
+    folder. Companion must be stopped. Returns their names."""
+    added = []
+    for sub in MODULE_KINDS:
+        src = os.path.join(where, sub)
+        if not os.path.isdir(src):
+            continue
+        have = _complete_local_modules(s, sub)
+        for name in sorted(os.listdir(src)):
+            dl = os.path.join(src, name)
+            if not os.path.exists(os.path.join(dl, "companion", "manifest.json")):
+                continue
+            if name not in have:
                 dst = os.path.join(s.base, sub, name)
                 if os.path.isdir(dst) and not s.sudo_files:
                     shutil.rmtree(dst, ignore_errors=True)      # an earlier half-copy
@@ -2034,7 +2373,15 @@ def download_modules(s):
                 if s.sudo_files:
                     run(["sudo", "chown", "-R", _owner(s), dst])
                 added.append(name)
+            shutil.rmtree(dl, ignore_errors=True)            # it's in Companion's folder now
     return added
+
+
+def download_modules(s):
+    """Fetch and install the module versions this rig is missing (Companion stopped)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fetch_modules(s, tmp)
+        return install_modules(s, tmp)
 
 
 # ---- files overview (the GUI's Files page) --------------------------------------
@@ -2150,6 +2497,12 @@ def take(s, confirm_takeover=None, manage_companion=True):
 def _take(s, confirm_takeover=None, manage_companion=True):
     """Lock the config to this rig and install the stored copy.
 
+    v2.0.0 order (agreed 8 Nov): the lock is claimed FIRST (claim_lock), then the
+    config and missing modules are brought into the waiting area while Companion
+    keeps running, and only then is Companion stopped, briefly, to install them.
+    If another rig gets the lock first, nothing is installed. A take that fails
+    or is cancelled after locking puts the lock back as it was.
+
     confirm_takeover(message) -> bool is asked before taking over a stale
     lock; without it, a stale lock is never taken over (e.g. at boot).
     manage_companion=False: Companion isn't running and mustn't be started
@@ -2162,12 +2515,12 @@ def _take(s, confirm_takeover=None, manage_companion=True):
     if m:
         raise SyncError(f"The config has moved {m}.\n\nChoose the new storage in Storage… on this rig.")
     h = lock_holder(s)
-    if h and holder_name(h) == s.rig:
-        mark_holding(s, True)
+    if h and holder_name(h) == s.rig and was_holding(s):
         if manage_companion and not companion_running(s):
             start_companion(s)
         return f"This rig ({s.rig}) already has the config."
-    if h:
+    mine_unfinished = bool(h) and holder_name(h) == s.rig     # locked here, but the take never finished
+    if h and not mine_unfinished:
         age = lock_age_hours(s)
         if age < s.stale_hours:
             raise SyncError(f"The config is being used by {holder_name(h)} "
@@ -2183,40 +2536,89 @@ def _take(s, confirm_takeover=None, manage_companion=True):
     if vkey(dv) > vkey(lv):
         raise NeedsUpdate(f"The config in {s.place} is from Companion {vtext(dv)}, but this rig "
                         f"has Companion {vtext(lv)}.\nUpdate Companion on this rig first.")
-    store = data_store(s)                      # encrypted? needs the passphrase before anything stops
-    if manage_companion:
-        stop_companion(s)
-    safety = None
+    store = data_store(s)                      # encrypted? needs the passphrase before anything changes
+    before = None if mine_unfinished else h
+    _step(s, 2, N, f"Locking the config to {s.rig}")
+    if not mine_unfinished:
+        claim_lock(s, before)
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            dl = os.path.join(tmp, dv)
-            _step(s, 2, N, f"Downloading the config from {s.place}")
-            store.pull_tree(dv, dl)
+        with _waiting_lock(s) as ours, tempfile.TemporaryDirectory() as tmp:
+            where = waiting_area(s) if ours else tmp          # another process is filling it: use our own
+            dl = os.path.join(where, dv)
+            _step(s, 3, N, f"Downloading the config from {s.place}")
+            _mirror_config(s, store, dv, dl)
             if not os.path.exists(os.path.join(dl, "db.sqlite")):
                 raise SyncError(f"The config in {s.place} looks incomplete (no db.sqlite).")
-            _step(s, 3, N, "Installing it in Companion's folder")
-            safety = install_config(s, dv, dl)
-            if vkey(dv) < vkey(lv):
-                # This rig has a newer Companion. Move its own newer folder aside so
-                # Companion upgrades the downloaded config when it starts.
-                moved = _move_to_safety(s, lv, "upgrade")
-                s.log(f"Companion {vtext(lv)} will upgrade the {vtext(dv)} config when it starts. "
-                      f"Old {lv} folder kept at {moved}")
-        _step(s, 4, N, "Copying modules this rig doesn't have")
-        _modules_step(s, download_modules, "added to this rig")
-        _step(s, 5, N, f"Locking the config to {s.rig}")
+            _modules_step(s, lambda s_: fetch_modules(s_, os.path.join(where, "modules")), "downloaded")
+            _step(s, 4, N, "Installing it in Companion's folder")
+            if manage_companion:
+                stop_companion(s)
+            safety = None
+            try:
+                safety = install_config(s, dv, dl)
+                if vkey(dv) < vkey(lv):
+                    # This rig has a newer Companion. Move its own newer folder aside so
+                    # Companion upgrades the downloaded config when it starts.
+                    moved = _move_to_safety(s, lv, "upgrade")
+                    s.log(f"Companion {vtext(lv)} will upgrade the {vtext(dv)} config when it starts. "
+                          f"Old {lv} folder kept at {moved}")
+                _modules_step(s, lambda s_: install_modules(s_, os.path.join(where, "modules")),
+                              "added to this rig")
+                _stop_if_cancelled(s)
+            except Cancelled:
+                if safety:                     # put this rig's own config back
+                    restore_safety_copy(s, dv, safety)
+                raise
+            finally:
+                if manage_companion:
+                    start_companion(s)
+        _step(s, 5, N, "Finishing")
         _rebeldeck_take(s)
-    except Cancelled:
-        if safety:                             # put this rig's own config back
-            restore_safety_copy(s, dv, safety)
+    except BaseException:
+        release_lock(s, before)
         raise
-    finally:
-        if manage_companion:
-            start_companion(s)
     write_lock(s, now())
     mark_holding(s, True)
+    storage_log(s, f"took the config (Companion {vtext(dv)})")
     record_ok(s, "take")
     return f"{s.rig} now has the config."
+
+
+def prefetch(s):
+    """The background download ("soft take", agreed 8 Nov): on the save schedule,
+    a rig that doesn't hold the config downloads it, if it's free, into the
+    waiting area, with any modules this rig is missing. Companion's own folder
+    isn't touched, so Companion carries on with what it has. A later take then
+    only needs a quick check and install. Never raises; returns a message or None."""
+    try:
+        if was_holding(s):
+            return None
+        if lock_holder(s):
+            return None                             # held: nothing to get ready for
+        dv = drive_version(s)
+        if not dv or vkey(dv) > vkey(local_version(s)):
+            return None
+        store = data_store(s)
+        with _waiting_lock(s) as ours:
+            if not ours:
+                return None
+            where = waiting_area(s)
+            for old in os.listdir(where):            # an older version's copy
+                if vkey(old) and old != dv:
+                    shutil.rmtree(os.path.join(where, old), ignore_errors=True)
+            _mirror_config(s, store, dv, os.path.join(where, dv))
+            added = fetch_modules(s, os.path.join(where, "modules"))
+        return f"Config ready for a quick take ({len(added)} new module{'s' if len(added) != 1 else ''} downloaded)."
+    except Exception as e:                           # noqa: BLE001
+        s.log(f"Background download skipped: {e}")
+        return None
+
+
+def tick(s):
+    """The save schedule: the holder saves; any other rig does the background download."""
+    if was_holding(s):
+        return save(s, quiet=True)
+    return prefetch(s)
 
 
 def _rebeldeck_save(s):
@@ -2264,6 +2666,12 @@ def _save(s, quiet=False):
         if quiet:
             return None
         raise SyncError("This rig doesn't have the config, so there's nothing to save.")
+    if not was_holding(s):
+        # Locked to this rig, but its take never finished (e.g. stopped at start-up):
+        # this rig's copy may be older than the stored one, so it must never be uploaded.
+        if quiet:
+            return None
+        raise SyncError("This rig's take didn't finish, so its copy isn't saved. Take the config again.")
     lv = local_version(s)
     dv = drive_version(s)
     if dv and vkey(lv) < vkey(dv):
@@ -2278,6 +2686,7 @@ def _save(s, quiet=False):
     _rebeldeck_save(s)
     write_lock(s, taken_time(h))
     mark_holding(s, True)
+    storage_log(s, f"saved (Companion {vtext(lv)})")
     record_ok(s, "save")
     note = f" (config upgraded to Companion {vtext(lv)})" if dv and lv != dv else ""
     return f"Saved to {s.place}{note}. {s.rig} still has the config."
@@ -2296,6 +2705,11 @@ def _return(s):
             mark_holding(s, False)
             return msg
         raise SyncError("This rig doesn't have the config, so there's nothing to return.")
+    if not was_holding(s):
+        storage_log(s, "returned the config (its take hadn't finished: nothing uploaded)")
+        s.store.delete("LOCK")
+        record_ok(s, "return")
+        return "This rig's take hadn't finished, so nothing was uploaded. The config is free again."
     # A cancelled return keeps the lock here (nothing half-sent is ever left unlocked).
     lv = local_version(s)
     _step(s, 1, 3, f"Uploading the config to {s.place}")
@@ -2303,6 +2717,7 @@ def _return(s):
     _step(s, 2, 3, "Uploading new modules")
     _modules_step(s, upload_modules, "uploaded")
     _step(s, 3, 3, "Unlocking it")
+    storage_log(s, f"returned the config (Companion {vtext(lv)})")
     s.store.delete("LOCK")
     mark_holding(s, False)
     record_ok(s, "return")
@@ -2320,6 +2735,7 @@ MOVED_FILE = "MOVED"
 
 def moved_to(s):
     """Where the config went, if it has moved out of this storage, else None."""
+    migrate_storage(s)
     text = s.store.read(MOVED_FILE)
     return text.strip() if text and text.strip() else None
 
@@ -2332,7 +2748,7 @@ def move_storage(s, new):
     if holder_name(lock_holder(s)) != s.rig:
         raise SyncError("Only the rig that has the config can move it. Take the config first.")
     if drive_version(new) or lock_holder(new):
-        raise SyncError(f"{new.place} already has a Companion Sync config in it. "
+        raise SyncError(f"{new.place} already has a Rebel Sync config in it. "
                         f"Move into an empty one (or a different folder / repository).")
     save(s)                                                   # the latest goes along
     old_data = data_store(s)
@@ -2357,7 +2773,7 @@ def move_storage(s, new):
     mark_holding(new, True)
     record_ok(new, "save")
     return (f"The config has moved to {new.place}, and {s.rig} still has it.\n\n"
-            f"On every other rig, choose {new.place} in Storage… (on a Pi: companion-sync setup), "
+            f"On every other rig, choose {new.place} in Storage… (on a Pi: rebel-sync setup), "
             f"with the same account. The old copy "
             f"stays in {s.place} as a backup, marked as moved.")
 
@@ -2393,7 +2809,7 @@ def check_storage(s):
     where = s.store.describe()
     if not dv:
         there = ("There's no config here yet. Open Companion on the rig whose config you want "
-                 "to share, and it'll offer to put it here (on a Pi: companion-sync take).")
+                 "to share, and it'll offer to put it here (on a Pi: rebel-sync take).")
     elif h:
         there = f"There's a Companion {vtext(dv)} config here, held by {holder_name(h)}."
     else:
@@ -2524,9 +2940,9 @@ def cli_setup(s):
     """Choose (or move to) the storage, sign in and check it, from a terminal."""
     import dataclasses
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        print("Run setup as the user Companion Sync runs as, WITHOUT sudo:\n    companion-sync setup")
+        print("Run setup as the user Rebel Sync runs as, WITHOUT sudo:\n    rebel-sync setup")
         return 1
-    print(f"Companion Sync setup for this rig: {s.rig}\nStorage now: {s.place}")
+    print(f"Rebel Sync setup for this rig: {s.rig}\nStorage now: {s.place}")
     moving = False
     try:
         if signed_in(s):
@@ -2553,7 +2969,7 @@ def cli_setup(s):
         mode = key.split("-")[1]
         if mode == "limited":
             use_github(n, "limited")
-            print("\n1. Make a PRIVATE repository on GitHub (for example companion-sync-config).\n"
+            print("\n1. Make a PRIVATE repository on GitHub (for example rebel-sync-config).\n"
                   "2. Open this page, choose 'Only select repositories' and tick just that one:\n"
                   f"     {github_install_link(n)}")
             _cli_ask("\nPress Enter when that's done")
@@ -2565,14 +2981,14 @@ def cli_setup(s):
         print(f"Signed in. Repository: {n.github_repo}")
     elif key == "nas":
         print("\nThe share must already be mounted on this Pi (for example in /etc/fstab, so it's "
-              "there after a restart). A CompanionSync folder is made inside it.")
+              "there after a restart). A RebelSync folder is made inside it.")
         use_folder(n, "nas", _cli_ask("Folder path, e.g. /mnt/nas/companion"))
     else:
         if _cli_yes(f"\nCan you use a web browser ON this Pi right now (a screen, or Raspberry Pi Connect's screen sharing)?"):
             if key == "gdrive":
                 cid, secret = google_client()
                 if not cid:
-                    raise SyncError("This copy of Companion Sync has no Google sign-in details.")
+                    raise SyncError("This copy of Rebel Sync has no Google sign-in details.")
                 use_rclone(n, "gdrive")
                 sign_in(n, cid, secret)
             else:
@@ -2600,14 +3016,14 @@ def cli_setup(s):
             local_version(s)
         except SyncError:
             print("\nThere's no config there yet, and Companion hasn't been run on this Pi. Run Companion "
-                  "once (or set up the rig whose config you want to share), then: companion-sync take")
+                  "once (or set up the rig whose config you want to share), then: rebel-sync take")
             return 0
         if _cli_yes(f"\nThere's no config in {s.place} yet. Put THIS Pi's Companion config there and "
                     f"share it from now on? (Only do this on the rig whose config you want to keep.)"):
             print(start_sharing(s))
     else:
         print("\nThe config is taken automatically when the Pi starts (if it's free), or now with:\n"
-              "    companion-sync take")
+              "    rebel-sync take")
     return 0
 
 
@@ -2651,7 +3067,7 @@ def main(argv):
         if cmd == "status":
             st = status(s)
             if st["moved"]:
-                print(f"The config has MOVED {st['moved']}. Run: companion-sync setup")
+                print(f"The config has MOVED {st['moved']}. Run: rebel-sync setup")
             if st["holder"]:
                 print(f"Config is TAKEN by: {st['holder']}  "
                       f"(last seen {st['age_hours']:.1f} hours ago)")
@@ -2674,6 +3090,10 @@ def main(argv):
                         f"{e} Put this rig's Companion config there and share it from now on?")):
                     raise
                 print("\nDONE. " + start_sharing(s))
+        elif cmd == "tick":
+            msg = tick(s)
+            if msg and not quiet:
+                print(msg)
         elif cmd == "save":
             msg = save(s, quiet)
             if msg and not quiet:

@@ -70,7 +70,7 @@ class World:
                 f.write(f"[gdrive]\ntype = alias\nremote = {shared}\n")
             extra = dict(storage="rclone", storage_kind="gdrive", rclone_config=conf)
         else:
-            extra = dict(storage="folder", storage_kind="nas", folder_path=os.path.join(shared, "CompanionSync"))
+            extra = dict(storage="folder", storage_kind="nas", folder_path=os.path.join(shared, "RebelSync"))
             os.makedirs(extra["folder_path"])
         self.shared = shared
         self.rigs = {}
@@ -79,7 +79,7 @@ class World:
             base = os.path.join(home, "companion")
             os.makedirs(base)
             s = E.Settings("mac", base, os.path.join(home, "safety"), os.path.join(home, "holding"),
-                           rig=name, state_file=os.path.join(home, "state.json"),
+                           rig=name, state_file=os.path.join(home, "state.json"), claim_wait=0.05,
                            key_file=os.path.join(home, "key.json"), log=lambda *a: None, **extra)
             if kind == "github":
                 s.github_token_file = os.path.join(home, "github.json")
@@ -267,9 +267,9 @@ def t_github_quick_setup(w):
     a.github_mode = "quick"
     E.github_sign_in(a, lambda c, u: None)
     assert gh.scopes_asked[-1] == "repo"
-    gh.repo, gh.repo_exists = "nige/companion-sync-config", False
-    assert E.github_quick_setup(a) == "nige/companion-sync-config" and gh.repo_exists and gh.repo_private
-    assert E.github_quick_setup(a) == "nige/companion-sync-config"           # already there: reused
+    gh.repo, gh.repo_exists = "nige/rebel-sync-config", False
+    assert E.github_quick_setup(a) == "nige/rebel-sync-config" and gh.repo_exists and gh.repo_private
+    assert E.github_quick_setup(a) == "nige/rebel-sync-config"           # already there: reused
     gh.repo_private = False
     expect_error(lambda: E.github_quick_setup(a), "public")                  # never use a public repo
     gh.repo_private = True
@@ -329,7 +329,7 @@ def t_choice_saved(w):
     nas = os.path.join(w.tmp, "nas-share")
     os.makedirs(nas)
     E.use_folder(a, "nas", nas)
-    assert a.folder_path == os.path.join(nas, "CompanionSync") and os.path.isdir(a.folder_path)
+    assert a.folder_path == os.path.join(nas, "RebelSync") and os.path.isdir(a.folder_path)
     E.save_storage_choice(a)
     fresh = E.Settings("mac", a.base, a.safety_dir, a.holding_file, rig="alpha", storage_file=a.storage_file)
     assert fresh.storage_kind == "gdrive"
@@ -345,7 +345,7 @@ def t_github_connect(w):
     gh, a = w.github, w.rigs["alpha"]
     a.github_client_id = ""                                   # connect_github fills these in
     E.connect_github(a, "quick", lambda c, u: None, lambda r: None)
-    assert (a.storage_kind, a.github_mode, a.github_repo) == ("github", "quick", "nige/companion-sync-config")
+    assert (a.storage_kind, a.github_mode, a.github_repo) == ("github", "quick", "nige/rebel-sync-config")
     gh.repo = "nige/companion-data"
     gh.installed = ["nige/companion-data", "nige/other"]
     E.connect_github(a, "limited", lambda c, u: None, lambda repos: repos[0])
@@ -519,7 +519,7 @@ def t_linux_companion_modes(w):
         s = settings()
         assert s.companion_mode == "desktop" and not E.companion_managed(s), s.companion_mode
         assert s.base == os.path.join(home, ".config", "companion-nodejs") and not s.sudo_files
-        assert s.safety_dir == os.path.join(home, ".config", "companion-sync-safety-copies")
+        assert s.safety_dir == os.path.join(home, ".config", "rebel-sync-safety-copies")
         assert E.local_version(s) == "v5.0"
 
         have["service"] = True
@@ -586,10 +586,242 @@ def t_cancel_take_restores(w):
     assert b.progress.snapshot().get("result") == "cancelled"
 
 
+# ---- v2.0.0 (Rebel Sync) -----------------------------------------------------
+
+def t_module_check_with_sudo(w):
+    """Companion's folders belong to another user: the check goes through one sudo
+    find, and modules already there are never downloaded again (BD-1, 8 Nov)."""
+    a = w.rigs["alpha"]
+    for n in ("aaa-1.0.0", "bbb-2.1.0"):
+        add_module(a.base, n)
+    os.makedirs(os.path.join(a.base, "modules", "half-1.0.0"))          # no manifest
+    real_run = E.run
+    seen = []
+
+    def fake_run(cmd, *args, **kw):
+        if cmd[:1] == ["sudo"]:
+            seen.append(cmd[1])
+            cmd = cmd[1:]
+        return real_run(cmd, *args, **kw)
+    E.run, a.sudo_files = fake_run, True
+    try:
+        assert E._complete_local_modules(a, "modules") == {"aaa-1.0.0", "bbb-2.1.0"}
+        assert seen == ["find"], seen
+    finally:
+        E.run, a.sudo_files = real_run, False
+
+
+def t_take_skips_modules_it_has(w):
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    add_module(a.base, "mod-1.0.0")
+    add_module(a.base, "other-2.0.0")
+    E.save(a)
+    E.return_(a)
+    make_config(b.base, value="b")
+    add_module(b.base, "mod-1.0.0")                                     # bravo has one already
+    fetched = []
+    real = E.fetch_modules
+
+    def counting(s, where):
+        got = real(s, where)
+        fetched.extend(got)
+        return got
+    E.fetch_modules = counting
+    try:
+        E.take(b)
+    finally:
+        E.fetch_modules = real
+    assert fetched == ["other-2.0.0"], fetched
+    assert os.path.exists(os.path.join(b.base, "modules", "other-2.0.0", "companion", "manifest.json"))
+
+
+def t_claims_one_winner(w):
+    """Two rigs take a free config at the same moment: exactly one gets it."""
+    import threading
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="b")
+    a.claim_wait = b.claim_wait = 0.3
+    results = {}
+
+    def go(s):
+        try:
+            results[s.rig] = E.take(s)
+        except E.SyncError as e:
+            results[s.rig] = e
+    ts = [threading.Thread(target=go, args=(s,)) for s in (a, b)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    won = [r for r, v in results.items() if isinstance(v, str)]
+    assert len(won) == 1, results
+    assert E.holder_name(E.lock_holder(a)) == won[0]
+    assert not a.store.files("claims"), "claims cleared"
+
+
+def t_stale_claim_ignored(w):
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="b")
+    b.store.write("claims/ghost", "ghost claims the config\n")
+    real = b.store.__class__.age_hours
+    b.store.__class__.age_hours = lambda self, rel: 1.0 if rel == "claims/ghost" else real(self, rel)
+    try:
+        E.take(b)
+    finally:
+        b.store.__class__.age_hours = real
+    assert E.holder_name(E.lock_holder(b)) == "bravo"
+
+
+def t_lost_claim_installs_nothing(w):
+    """Another rig locks it while this one is claiming: nothing is installed."""
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="b")
+    real_sleep = E.time.sleep
+    E.time.sleep = lambda t: E.write_lock(a, E.now())                  # alpha locks it meanwhile
+    try:
+        expect_error(lambda: E.take(b), "took the config")
+    finally:
+        E.time.sleep = real_sleep
+    assert read_value(b.base) == "b"
+    assert E.holder_name(E.lock_holder(b)) == "alpha"
+
+
+def t_failed_take_releases_lock(w):
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="b")
+    real = E.install_config
+
+    def boom(*args):
+        raise E.SyncError("disk full")
+    E.install_config = boom
+    try:
+        expect_error(lambda: E.take(b), "disk full")
+    finally:
+        E.install_config = real
+    assert E.lock_holder(b) is None, "lock put back"
+    assert not E.was_holding(b)
+
+
+def t_prefetch_then_quick_take(w):
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    add_module(a.base, "mod-1.0.0")
+    E.save(a)
+    make_config(b.base, value="b")
+    assert E.prefetch(b) is None, "held by alpha: nothing downloaded"
+    E.return_(a)
+    msg = E.prefetch(b)
+    assert msg and "ready" in msg, msg
+    assert read_value(b.base) == "b", "Companion's folder untouched"
+    wa = E.waiting_area(b)
+    assert os.path.exists(os.path.join(wa, "v5.0", "db.sqlite"))
+    assert os.path.exists(os.path.join(wa, "modules", "modules", "mod-1.0.0", "companion", "manifest.json"))
+    pulled = []
+    real = b.store.__class__.copy_down
+    b.store.__class__.copy_down = lambda self, rel, local: (pulled.append(rel), real(self, rel, local))
+    try:
+        E.take(b)
+    finally:
+        b.store.__class__.copy_down = real
+    assert pulled == [], f"modules came from the waiting area: {pulled}"
+    assert read_value(b.base) == "one"
+    assert os.path.exists(os.path.join(b.base, "modules", "mod-1.0.0", "companion", "manifest.json"))
+    assert E.tick(b) and E.holder_name(E.lock_holder(b)) == "bravo"   # holder's tick saves
+
+
+def t_unfinished_take(w):
+    """Locked to this rig but the take never finished: never saved over the stored
+    copy; the next take completes it."""
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="old on bravo")
+    E.write_lock(b, E.now())                                             # killed mid-take
+    assert E.save(b, quiet=True) is None
+    expect_error(lambda: E.save(b), "didn't finish")
+    assert E.take(b) == "bravo now has the config."
+    assert read_value(b.base) == "one"
+
+
+def t_storage_log(w):
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    E.return_(a)
+    make_config(b.base, value="b")
+    E.take(b)
+    log = a.store.read("LOG.txt")
+    assert "alpha: saved" in log and "alpha: returned" in log and "bravo: took" in log, log
+
+
+def t_rename_local_files(w):
+    home = os.path.join(w.tmp, "oldhome")
+    os.makedirs(os.path.join(home, ".config", "companion-sync"))
+    for n in ("holding", "rig-name", "storage.json"):
+        with open(os.path.join(home, ".companion-sync-" + n), "w") as f:
+            f.write(n)
+    with open(os.path.join(home, ".config", "companion-sync", "settings.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(home, ".rebel-sync-rig-name"), "w") as f:
+        f.write("kept")                                                  # never overwritten
+    E.migrate_local_names(home)
+    assert open(os.path.join(home, ".rebel-sync-holding")).read() == "holding"
+    assert open(os.path.join(home, ".rebel-sync-rig-name")).read() == "kept"
+    assert os.path.exists(os.path.join(home, ".config", "rebel-sync", "settings.json"))
+    assert not os.path.exists(os.path.join(home, ".companion-sync-holding"))
+
+
+def t_rename_storage_folder(w):
+    """Folder storage: CompanionSync is renamed to RebelSync once; the old place is
+    marked as moved, so a rig still on Companion Sync is told and never uses it."""
+    if w.kind == "rclone":
+        seed(w)
+        a, b = w.rigs["alpha"], w.rigs["bravo"]
+        os.replace(os.path.join(w.shared, "RebelSync"), os.path.join(w.shared, "CompanionSync"))
+        E._MIGRATED.clear()
+        for s in (a, b):
+            s._storage_migrated = False
+        assert E.holder_name(E.lock_holder(a)) == "alpha"                # renamed by rclone moveto
+        assert os.path.exists(os.path.join(w.shared, "RebelSync", "CURRENT"))
+        assert "Rebel Sync" in open(os.path.join(w.shared, "CompanionSync", "MOVED")).read()
+        assert E.holder_name(E.lock_holder(b)) == "alpha"
+        oldrig = dataclasses.replace(b, folder="CompanionSync")
+        oldrig._storage_migrated = True
+        assert "Rebel Sync" in E.moved_to(oldrig)
+        return
+    if w.kind != "folder":
+        return
+    seed(w)
+    a, b = w.rigs["alpha"], w.rigs["bravo"]
+    old = os.path.join(w.shared, "CompanionSync")
+    os.replace(a.folder_path, old)
+    for s in (a, b):
+        s.folder_path = old
+        s.storage_file = os.path.join(os.path.dirname(s.holding_file), "storage.json")
+        s._storage_migrated = False
+    assert E.holder_name(E.lock_holder(a)) == "alpha"                    # first use moves it
+    assert a.folder_path == os.path.join(w.shared, "RebelSync")
+    assert "Rebel Sync" in open(os.path.join(old, "MOVED")).read()
+    assert E.holder_name(E.lock_holder(b)) == "alpha"                    # second rig follows
+    assert b.folder_path == a.folder_path
+    oldrig = dataclasses.replace(b, folder_path=old)
+    oldrig._storage_migrated = True                                      # behaves like v1
+    assert "Rebel Sync" in E.moved_to(oldrig)
+
+
 SCENARIOS = [t_progress_steps, t_cancel_take_restores, t_linux_companion_modes, t_sign_in_elsewhere, t_move_storage, t_move_encrypted, t_encryption, t_encryption_off, t_github_connect, t_first_rig_starts_sharing, t_check_storage, t_messages_name_storage, t_choice_saved, t_first_save_and_status, t_take_refused_while_held, t_return_then_take,
              t_save_keeps_history, t_stale_takeover_and_stranded, t_modules_travel, t_modules_duplicates_and_half_copies,
              t_older_companion_refused, t_boot, t_unreachable, t_github_race,
-             t_github_quick_setup, t_github_limited]
+             t_github_quick_setup, t_github_limited,
+             t_module_check_with_sudo, t_take_skips_modules_it_has, t_claims_one_winner, t_stale_claim_ignored,
+             t_lost_claim_installs_nothing, t_failed_take_releases_lock, t_prefetch_then_quick_take,
+             t_unfinished_take, t_storage_log, t_rename_local_files, t_rename_storage_folder]
 
 
 def main():

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""BD-1 panel: Companion Sync status and controls on the touchscreen.
+"""BD-1 panel: Rebel Sync status and controls on the touchscreen.
 
-  python3 panel.py                  run on the Pi (systemd: companion-panel.service)
+  python3 panel.py                  run on the Pi (systemd: rebel-sync-panel.service)
   python3 panel.py --preview DIR    render sample screens to PNG files in DIR,
                                     one folder per screen and orientation
 
@@ -10,7 +10,7 @@ Every screen is laid out for the size it's drawn at: 2.4" (320x240) or
 The 2.4" landscape layout is the original design; the others are worked out
 from it (see Layout).
 
-Settings: ~/.config/companion-sync/panel.json overrides any of DEFAULTS below.
+Settings: ~/.config/rebel-sync/panel.json overrides any of DEFAULTS below.
 """
 import copy
 import dataclasses
@@ -64,13 +64,16 @@ DEFAULTS = {
     "companion_api": "https://api.bitfocus.io/v1/product/companion/packages",
     "companion_majors": [3, 4, 5],
     # sync and updates
-    "boot_report": "/run/companion-sync/boot.json",
-    "log_file": "~/.local/state/companion-sync/panel.log",
-    "github_repo": "nisted/companion-sync",
-    "github_token_file": "~/.config/companion-sync/github-token",
-    "pi_asset": "Companion-Sync-Pi.tar.gz",
+    "boot_report": "/run/rebel-sync/boot.json",
+    "log_file": "~/.local/state/rebel-sync/panel.log",
+    "github_repo": "nisted/rebel-sync",
+    "github_token_file": "~/.config/rebel-sync/github-token",
+    "pi_asset": "Rebel-Sync-Pi.tar.gz",
 }
-SETTINGS_FILE = os.path.expanduser("~/.config/companion-sync/panel.json")
+SETTINGS_FILE = os.path.expanduser("~/.config/rebel-sync/panel.json")
+# v2.0.0: panel.json values written for Companion Sync, moved to their new names
+RENAMED = {"/run/companion-sync/": "/run/rebel-sync/", "/companion-sync/": "/rebel-sync/",
+           "nisted/companion-sync": "nisted/rebel-sync", "Companion-Sync-Pi.tar.gz": "Rebel-Sync-Pi.tar.gz"}
 
 TABS = ["SYSTEM", "NETWORK", "COMPANION", "SYNC"]
 NEEDS_CONFIRM = {"restart", "shutdown", "return", "update_companion", "calibrate"}
@@ -87,6 +90,10 @@ def load_settings():
             mine = json.load(f)
         cols = mine.pop("colours", {})
         cfg.update({k: v for k, v in mine.items() if not k.startswith("_")})
+        for k in ("boot_report", "log_file", "github_repo", "github_token_file", "pi_asset"):
+            if isinstance(cfg.get(k), str):
+                for old, new in RENAMED.items():
+                    cfg[k] = cfg[k].replace(old, new)
         cfg["colours"].update(cols)
     except FileNotFoundError:
         pass
@@ -176,7 +183,7 @@ def version_label():
     return f"build {b}"
 
 
-PROGRESS_FILE = os.path.expanduser("~/.companion-sync-progress.json")
+PROGRESS_FILE = os.path.expanduser("~/.rebel-sync-progress.json")
 
 
 class Panel:
@@ -527,13 +534,13 @@ class Panel:
         else:
             drive = (None, None)
         self.readout(d, 60, "DRIVE", *drive)
-        self.readout(d, 76, "COMPANION SYNC", version_label().upper())
+        self.readout(d, 76, "REBEL SYNC", version_label().upper())
         problem = self.sync_problem()
         if not self.draw_progress(d, L.y(88)) and problem:
             d.text((W // 2, L.y(96)), problem, font=self.F.btn, fill=C["red"], anchor="mm")
         buttons = (("take", "TAKE", "purple"), ("save", "SAVE NOW", "cyan"),
                    ("return", "RETURN", "purple"), ("status", "STATUS", "cyan"),
-                   ("log", "LOG", "cyan"), ("update_cs", "UPDATE CS", "cyan"))
+                   ("log", "LOG", "cyan"), ("update_cs", "UPDATE RS", "cyan"))
         cols = 2 if L.portrait else 3
         rows = -(-len(buttons) // cols)
         gap = u(6)
@@ -548,7 +555,7 @@ class Panel:
     def draw_menu(self, d):
         """What the panel shows. Tap the title block to come back here."""
         L, W, H, u = self.L, self.W, self.H, self.L.u
-        entries = [("page:sync", "COMPANION SYNC", "purple", True),
+        entries = [("page:sync", "REBEL SYNC", "purple", True),
                    ("page:rebeldeck", "REBELDECK", "purple", True),
                    ("page:screen", "SCREEN", "cyan", True)]
         top, bottom, gap = L.top + u(6), H - u(10), u(8)
@@ -1000,8 +1007,8 @@ class Panel:
 
     def do_log(self):
         lines = []
-        out = info.sh(["sudo", "journalctl", "-u", "companion-panel", "-u", "companion-sync-boot",
-                       "-u", "companion-sync-save", "-n", "40", "--no-pager", "-o", "short"])
+        out = info.sh(["sudo", "journalctl", "-u", "rebel-sync-panel", "-u", "rebel-sync-boot",
+                       "-u", "rebel-sync-save", "-n", "40", "--no-pager", "-o", "short"])
         for line in (out or "").splitlines():
             if "pam_unix" in line or "COMMAND=" in line:     # sudo's own bookkeeping
                 continue
@@ -1019,10 +1026,10 @@ class Panel:
             return
         with open(token_file) as f:
             token = f.read().strip()
-        self.busy("UPDATE CS", "Checking GitHub for a newer build.")
+        self.busy("UPDATE RS", "Checking GitHub for a newer build.")
         api = f"https://api.github.com/repos/{self.cfg['github_repo']}/releases/latest"
         hdr = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-               "User-Agent": "companion-panel"}
+               "User-Agent": "rebel-sync-panel"}
         with urllib.request.urlopen(urllib.request.Request(api, headers=hdr), timeout=20) as r:
             rel = json.loads(r.read().decode())
         new = rel.get("tag_name", "").replace("build-", "")
@@ -1033,22 +1040,22 @@ class Panel:
         if not asset:
             self.message("NOT DONE", f"Build {new} has no Pi package.", colour=self.C["amber"])
             return
-        self.busy("UPDATE CS", f"Downloading build {new}.")
-        tmp = tempfile.mkdtemp(prefix="companion-sync-update-")
+        self.busy("UPDATE RS", f"Downloading build {new}.")
+        tmp = tempfile.mkdtemp(prefix="rebel-sync-update-")
         req = urllib.request.Request(asset["url"], headers=dict(hdr, Accept="application/octet-stream"))
         tgz = os.path.join(tmp, self.cfg["pi_asset"])
         with urllib.request.urlopen(req, timeout=120) as r, open(tgz, "wb") as f:
             f.write(r.read())
         with tarfile.open(tgz) as t:
             t.extractall(tmp, filter="data")
-        installer = os.path.join(tmp, "companion-sync", "pi", "install.sh")
+        installer = os.path.join(tmp, "rebel-sync", "pi", "install.sh")
         if not os.path.exists(installer):
             self.message("NOT DONE", "The download doesn't contain the installer.", colour=self.C["red"])
             return
-        log.info("Companion Sync update: build %s -> %s", self.build, new)
-        self.busy("UPDATE CS", f"Installing build {new}.", "The panel restarts when it's done.")
+        log.info("Rebel Sync update: build %s -> %s", self.build, new)
+        self.busy("UPDATE RS", f"Installing build {new}.", "The panel restarts when it's done.")
         # run outside this service, so restarting the panel doesn't stop the install
-        subprocess.run(["sudo", "systemd-run", "--unit", f"companion-sync-update-{int(time.time())}",
+        subprocess.run(["sudo", "systemd-run", "--unit", f"rebel-sync-update-{int(time.time())}",
                         "--collect", "/bin/bash", installer, "--from-update"])
 
     # ---- main loop -------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Companion Sync's link to RebelDeck (https://github.com/nisted/RebelDeck).
+"""Rebel Sync's link to RebelDeck (https://github.com/nisted/RebelDeck).
 
 Two separate apps that know about each other:
   - the tray menu gets a RebelDeck item: show/hide its decks, open its web GUI,
@@ -8,7 +8,7 @@ Two separate apps that know about each other:
     next to the LOCK file; which deck windows are open stays each rig's choice).
 
 Everything here is best-effort: if RebelDeck isn't installed or running,
-Companion Sync carries on as if it didn't exist.
+Rebel Sync carries on as if it didn't exist.
 """
 import json
 import os
