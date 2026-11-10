@@ -25,6 +25,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -1027,11 +1028,20 @@ class Panel:
         with open(token_file) as f:
             token = f.read().strip()
         self.busy("UPDATE RS", "Checking GitHub for a newer build.")
-        api = f"https://api.github.com/repos/{self.cfg['github_repo']}/releases/latest"
         hdr = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "User-Agent": "rebel-sync-panel"}
-        with urllib.request.urlopen(urllib.request.Request(api, headers=hdr), timeout=20) as r:
-            rel = json.loads(r.read().decode())
+        rel, err = None, None
+        # the repo under its new name, else its old one (before the rename)
+        for repo in dict.fromkeys((self.cfg["github_repo"], "nisted/rebel-sync", "nisted/companion-sync")):
+            api = f"https://api.github.com/repos/{repo}/releases/latest"
+            try:
+                with urllib.request.urlopen(urllib.request.Request(api, headers=hdr), timeout=20) as r:
+                    rel = json.loads(r.read().decode())
+                break
+            except urllib.error.HTTPError as e:
+                err = e
+        if rel is None:
+            raise err
         new = rel.get("tag_name", "").replace("build-", "")
         if new == self.build:
             self.message("UP TO DATE", f"BD-1 already has {version_label()}.", colour=self.C["green"])

@@ -85,6 +85,7 @@ LABEL = f"v{VERSION} (build {BUILD})"       # what the pop-up, GUI and menu show
 
 LINUX = not E.WIN and not E.MAC
 REPO = "nisted/rebel-sync"
+OLD_REPO = "nisted/companion-sync"       # until the repo is renamed (GitHub redirects old -> new after)
 RELEASES = f"https://github.com/{REPO}/releases/latest"
 LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 UPDATE_ASSET = ("Rebel-Sync-Setup.exe" if E.WIN else
@@ -184,6 +185,21 @@ def rclone_outside_temp(src):
     except OSError:
         log.exception("couldn't copy rclone out of the temp folder")
         return src
+
+
+def latest_release():
+    """The latest release, from the repo under its new name, else its old one
+    (works before and after the rename). Points RELEASES at whichever answered."""
+    global RELEASES
+    err = None
+    for repo in (REPO, OLD_REPO):
+        try:
+            rel = json.loads(fetch(f"https://api.github.com/repos/{repo}/releases/latest"))
+            RELEASES = f"https://github.com/{repo}/releases/latest"
+            return rel
+        except Exception as e:                       # noqa: BLE001
+            err = e
+    raise err
 
 
 def fetch(url, dest=None):
@@ -1085,7 +1101,7 @@ class App:
         """Latest release, checked at most every 10 minutes."""
         if not self.latest or time.time() - self.latest[0] > 600:
             try:
-                rel = json.loads(fetch(LATEST_API))
+                rel = latest_release()
                 name = (rel.get("name") or "").removeprefix("Rebel Sync ").removeprefix("Companion Sync ").strip()
                 self.latest = (time.time(), rel.get("tag_name", "").removeprefix("build-"), name)
             except Exception:
@@ -1338,7 +1354,7 @@ class App:
             return
         self.set_state("busy", "Checking for an update…")
         try:
-            rel = json.loads(fetch(LATEST_API))
+            rel = latest_release()
         except Exception as e:
             raise E.SyncError(f"Can't reach GitHub to check for an update. Are you online?\n{e}")
         new = rel.get("tag_name", "").removeprefix("build-")
